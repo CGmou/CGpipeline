@@ -90,6 +90,10 @@ TASK_ABBR = {
     'Comp': 'comp', 'FX': 'fx', 'CFX': 'cfx', 'Assembly': 'asb', 'Setdress': 'sd'
 }
 
+CACHE_FOLDER_MAP = {
+    'anim': 'Anim', 'blk': 'Blocking', 'fx': 'FX', 'cfx': 'CFX', 'lo': 'Layout'
+}
+
 def get_latest_version(folder_path):
     if not folder_path or not os.path.exists(folder_path): return 0
     try:
@@ -160,6 +164,20 @@ class CGP_WindowManagerProps(bpy.types.PropertyGroup):
     collection_links: bpy.props.CollectionProperty(type=CGP_CollectionLink); collection_index: bpy.props.IntProperty(default=0)
     import_mode: bpy.props.EnumProperty(name='Mode', items=[('LINK', 'Link', ''), ('APPEND', 'Append', '')])
     cache_tool_target_index: bpy.props.IntProperty(default=-1)
+    cache_anim_only: bpy.props.BoolProperty(name="Anim Only", default=False)
+    
+    cache_prefix: bpy.props.EnumProperty(
+        name="Task Prefix",
+        description="Filter caches by task/department",
+        items=[
+            ('anim', 'Animation', ''),
+            ('blk', 'Blocking', ''),
+            ('fx', 'FX', ''),
+            ('cfx', 'CFX', ''),
+            ('lo', 'Layout', '')
+        ],
+        default='anim'
+    )
 
 # --- UI LISTS ---
 class CGP_UL_PublishList(bpy.types.UIList):
@@ -512,7 +530,11 @@ class CGP_OT_PublishAction(bpy.types.Operator):
                     if t == 'Lookdev' and fmt in {'.usd', '.blend'}:
                         fn = f'{e}_lkdev{fmt}' if not props.publish_separate else f'{e}_lkdev_{i.name}{fmt}'
                     else:
-                        fn = f'{e}_cam_f{s}_f{ef}{fmt}' if is_c else f'{e}_{abbr}_{i.name}{fmt}'
+                        ext_upper = fmt[1:].upper()
+                        if is_c: fn = f'{e}_cam_f{s}_f{ef}{fmt}'
+                        else:
+                            if c == 'Shots': fn = f'{e}_{abbr}_{i.name}_{ext_upper}{fmt}'
+                            else: fn = f'{e}_{abbr}_{i.name}{fmt}'
                     
                     do_export([i.name], fn, is_camera=is_c)
             else:
@@ -520,7 +542,12 @@ class CGP_OT_PublishAction(bpy.types.Operator):
                 if t == 'Lookdev' and fmt in {'.usd', '.blend'}:
                     fn = f'{e}_lkdev{fmt}'
                 else:
-                    fn = f'{e}_{abbr}{fmt}' if c == 'Assets' else f'{e}{fmt}'
+                    ext_upper = fmt[1:].upper()
+                    if c == 'Shots':
+                        # Project_Shot_Entity_Task_EXT.ext
+                        fn = f'{e}_{abbr}_{ext_upper}{fmt}'
+                    else:
+                        fn = f'{e}_{abbr}{fmt}'
                 
                 do_export([i.name for i in props.publish_list], fn)
             return {'FINISHED'}
@@ -552,36 +579,31 @@ class CGP_OT_AssemblyScan(bpy.types.Operator):
                                 item = props.lookdev_items.add()
                                 item.name = f; item.path = os.path.join(pub_folder, f); item.asset_name = asset
 
-        # 2. SCAN CACHES: Search current Shot -> Dept -> Publish for *_anim_* (abc/usd)
+        # 2. SCAN CACHES: Search all departments in current Shot for cache files
         p = props.active_task_path or os.environ.get('CGP_TASK_PATH', '').strip()
         if p:
-            # 1. Identify the Shot Root
-            # Path is usually: .../Shots/SH01_SQ0010/Anim/_wip
             norm_p = os.path.normpath(p).replace('\\', '/')
             parts = norm_p.split('/')
             shot_root = ""
-            
             if "Shots" in parts:
                 idx = parts.index("Shots")
-                if len(parts) > idx + 1:
-                    # shot_root is .../Shots/SH01_SQ0010
-                    shot_root = os.path.normpath("/".join(parts[:idx+2]))
+                if len(parts) > idx + 1: shot_root = os.path.normpath("/".join(parts[:idx+2]))
             
             if shot_root and os.path.exists(shot_root):
-                print(f"CGPipeline: Scanning for caches in shot: {shot_root}")
-                # Departments to check for publishes
-                for dept in ["Anim", "Animation", "Blocking", "Layout", "lo"]:
-                    dept_pub = os.path.normpath(os.path.join(shot_root, dept, "Publish"))
-                    if os.path.isdir(dept_pub):
-                        print(f"CGPipeline: Checking publish folder: {dept_pub}")
-                        for f in os.listdir(dept_pub):
+                # Scan EVERY folder in the shot root
+                for dept in os.listdir(shot_root):
+                    pub_dir = os.path.join(shot_root, dept, "Publish")
+                    if os.path.isdir(pub_dir):
+                        for f in os.listdir(pub_dir):
                             f_low = f.lower()
-                            # Search for files with _anim_ marker in the filename
-                            if '_anim_' in f_low and f_low.endswith(('.abc', '.usd', '.usdc', '.usda')):
+                            if f_low.endswith(('.abc', '.usd', '.usdc', '.usda', '.fbx')):
+                                # Apply "Anim Only" filter if enabled
+                                if props.cache_anim_only and '_anim_' not in f_low:
+                                    continue
+                                
                                 if not any(i.name == f for i in props.cache_items):
                                     item = props.cache_items.add()
                                     item.name = f
-                                    print(f"CGPipeline: Found cache: {f}")
             else:
                 print(f"CGPipeline Debug: Could not resolve shot root from path: {p}")
         
@@ -685,14 +707,24 @@ class CGP_OT_AssemblyApply(bpy.types.Operator):
     def execute(self, context):
         props = context.window_manager.cgp_props; p = props.active_task_path or os.environ.get('CGP_TASK_PATH', '').strip()
         if not p: return {'CANCELLED'}
-        shot_root = os.path.dirname(p)
+        shot_root = ""
+        norm_p = os.path.normpath(p).replace('\\', '/')
+        parts = norm_p.split('/')
+        if "Shots" in parts:
+            idx = parts.index("Shots")
+            if len(parts) > idx + 1: shot_root = os.path.normpath("/".join(parts[:idx+2]))
+        
+        if not shot_root: return {'CANCELLED'}
+            
         links = props.collection_links if self.batch else [l for l in props.collection_links if l.is_selected]
         for l in links:
             if not l.assigned_cache: continue
             fp = None
-            for sub in ["Anim", "Animation", "Blocking"]:
-                test_p = os.path.normpath(os.path.join(shot_root, sub, "Publish", l.assigned_cache))
+            # Search in all department publish folders for the assigned filename
+            for dept in os.listdir(shot_root):
+                test_p = os.path.normpath(os.path.join(shot_root, dept, "Publish", l.assigned_cache))
                 if os.path.exists(test_p): fp = test_p; break
+            
             if not fp: continue
             db = next((c for c in bpy.data.cache_files if hasattr(c,'filepath') and bpy.path.abspath(c.filepath)==fp), None)
             if not db:
@@ -751,7 +783,13 @@ class CGP_PT_AssemblyPanel(bpy.types.Panel):
         b = l.box(); b.label(text="2. IMPORT LOOKDEV:", icon='MATERIAL'); b.template_list("CGP_UL_LookdevList", "lkdev", p, "lookdev_items", p, "lookdev_index")
         r = b.row(align=True); r.prop(p, 'import_mode', text=""); r.operator("cgp.assembly_import_lkdev", text="LINK", icon='IMPORT')
         l.separator(); l.operator("cgp.assembly_make_override", text="3. MAKE OVERRIDE", icon='LIBRARY_DATA_OVERRIDE')
-        b = l.box(); b.label(text="4. ASSIGN CACHES:", icon='LINKED'); b.template_list("CGP_UL_CollectionLinkList", "links", p, "collection_links", p, "collection_index")
+        
+        b = l.box(); b.label(text="4. ASSIGN CACHES:", icon='LINKED')
+        b.template_list("CGP_UL_CollectionLinkList", "links", p, "collection_links", p, "collection_index")
+        
+        row = b.row(align=True)
+        row.prop(p, "cache_anim_only", text="ANIM ONLY", icon='FILTER')
+        
         row = b.row(align=True); row.scale_y = 1.2
         row.operator("cgp.assembly_apply", text="APPLY SELECTED", icon='CHECKMARK').batch=False
         row.operator("cgp.assembly_apply", text="APPLY ALL", icon='PLAY').batch=True
