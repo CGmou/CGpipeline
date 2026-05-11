@@ -21,7 +21,14 @@ def get_latest_version(folder_path):
     latest_file = None
     
     # 1. Try to find by version pattern
+    dcc_extensions = ['.blend', '.ma', '.mb', '.hip', '.hipnc', '.hiplc']
+    
     for f in files:
+        # Avoid Blender backup files like .blend1, .blend2
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in dcc_extensions:
+            continue
+            
         match = version_pattern.search(f)
         if match:
             v = int(match.group(1))

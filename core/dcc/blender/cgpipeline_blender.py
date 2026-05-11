@@ -370,8 +370,13 @@ class CGP_OT_OpenDashboard(bpy.types.Operator):
                  return {'CANCELLED'}
 
             # Launch using system python to avoid DCC environment issues
-            # We use 'pythonw' on Windows to avoid opening a console window, or just 'python'
+            # We use 'python3' on macOS/Linux as 'python' is often not available or refers to Python 2.
             python_exe = "python"
+            if os.name != 'nt':
+                python_exe = shutil.which("python3") or shutil.which("python") or "python3"
+            else:
+                # On Windows, try pythonw to avoid console window, fallback to python
+                python_exe = shutil.which("pythonw") or shutil.which("python") or "python"
             
             # Prepare environment variables to keep context (Project Root, etc.)
             env = os.environ.copy()
@@ -477,7 +482,35 @@ class CGP_OT_PublishAction(bpy.types.Operator):
         props = context.window_manager.cgp_props
         p, e, t, c = props.active_task_path, props.active_entity, props.active_task_type, props.active_category
         if not p or not props.publish_list: return {'CANCELLED'}
-        pub = os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(p)), 'Publish'))
+        
+        # Robust Publish Directory Discovery
+        # We look for a 'Publish' folder adjacent to where we are, or in the parent folder
+        task_dir = os.path.dirname(p)
+        pub = None
+        
+        # Strategy: Look for 'Publish' in the parent directory of the task path
+        # Assets: Project/Assets/Category/AssetName/mdl/wip/ -> Project/Assets/Category/AssetName/Publish/
+        # Shots: Project/Shots/Seq/Shot/anim/wip/ -> Project/Shots/Seq/Shot/Publish/
+        
+        check_dir = task_dir
+        for _ in range(4): # Search up to 4 levels
+            potential_pub = os.path.join(check_dir, 'Publish')
+            if os.path.exists(potential_pub):
+                pub = potential_pub
+                break
+            # Also check siblings if 'wip' is in the path
+            if os.path.basename(check_dir).lower() == 'wip':
+                sibling_pub = os.path.join(os.path.dirname(check_dir), 'Publish')
+                if os.path.exists(sibling_pub):
+                    pub = sibling_pub
+                    break
+            check_dir = os.path.dirname(check_dir)
+            if os.path.basename(check_dir) in {'Assets', 'Shots', ''}: break
+
+        if not pub:
+            # Fallback to the old logic if discovery fails
+            pub = os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(p)), 'Publish'))
+            
         os.makedirs(pub, exist_ok=True); abbr, fmt = TASK_ABBR.get(t, 'task'), props.format_enum
         is_anim = props.range_mode != 'STILL'
         s = context.scene.frame_current if props.range_mode == 'STILL' else context.scene.frame_start if props.range_mode == 'SLIDER' else props.start_frame

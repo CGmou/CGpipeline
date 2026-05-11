@@ -1,6 +1,9 @@
 ﻿import sys
 import os
-from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget
+import json
+import platform
+import subprocess
+from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QMessageBox
 from core.auth import AuthManager
 from core.hub import HubManager
 from ui.login_view import LoginView
@@ -11,6 +14,9 @@ from ui.settings_dialog import ProjectRootDialog, DCCPathsDialog
 class CGPipelineApp(QMainWindow):
     def __init__(self, system_root):
         super().__init__()
+        self.system_root = system_root
+        self.lock_file = os.path.join(system_root, "app.lock")
+        
         self.setWindowTitle("CGPipeline")
         self.resize(1200, 850)
         self.setStyleSheet("QMainWindow { background-color: #121212; }")
@@ -31,6 +37,66 @@ class CGPipelineApp(QMainWindow):
                 self.show_login()
         else:
             self.show_login()
+
+    def check_single_instance(self):
+        if os.path.exists(self.lock_file):
+            try:
+                with open(self.lock_file, "r") as f:
+                    pid = int(f.read().strip())
+                if os.name == 'nt':
+                    # Windows PID check
+                    import ctypes
+                    process_exists = ctypes.windll.kernel32.OpenProcess(1, False, pid) > 0
+                else:
+                    # Unix PID check
+                    try:
+                        os.kill(pid, 0)
+                        process_exists = True
+                    except OSError:
+                        process_exists = False
+                
+                if process_exists:
+                    self.bring_to_front(pid)
+                    return False
+            except: pass
+            
+        with open(self.lock_file, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+
+    def bring_to_front(self, pid):
+        """Attempts to bring the existing process window to the front."""
+        system = platform.system()
+        if system == "Darwin":
+            try:
+                # Use AppleScript to focus the process by PID
+                script = f'tell application "System Events" to set frontmost of every process whose unix id is {pid} to true'
+                subprocess.run(["osascript", "-e", script])
+            except Exception as e:
+                print(f"Failed to focus existing window on macOS: {e}")
+        elif system == "Windows":
+            try:
+                import ctypes
+                def enum_window_callback(hwnd, lparam):
+                    window_pid = ctypes.c_int()
+                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+                    if window_pid.value == lparam:
+                        ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                        return False
+                    return True
+
+                callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+                callback = callback_type(enum_window_callback)
+                ctypes.windll.user32.EnumWindows(callback, pid)
+            except Exception as e:
+                print(f"Failed to focus existing window on Windows: {e}")
+
+    def closeEvent(self, event):
+        if hasattr(self, 'lock_file') and os.path.exists(self.lock_file):
+            try: os.remove(self.lock_file)
+            except: pass
+        super().closeEvent(event)
 
     def setup_menubar(self):
         menubar = self.menuBar()
@@ -98,10 +164,12 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
 
     window = CGPipelineApp(system_root)
+    if not window.check_single_instance():
+        sys.exit(0)
     
     # Save current app path for DCCs to find
     window.auth.settings["app_main_path"] = os.path.abspath(__file__)
-    window.auth.save_settings(window.auth.settings.get("last_user", ""), "", window.auth.settings.get("remember", False))
+    window.auth.save_settings(window.auth.settings.get("last_user", ""), window.auth.settings.get("last_pass", ""), window.auth.settings.get("remember", False))
     
     window.show()
     sys.exit(app.exec())
