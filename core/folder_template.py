@@ -18,17 +18,17 @@ def create_asset_structure(base_path):
 def create_shot_structure(base_path):
     """Creates the detailed shot folder structure."""
     sub_folders = [
-        "01_Layout",
-        "02_Blocking",
-        "03_Anim",
-        "04_Cfx/_wip",
-        "04_Cfx/cache",
-        "04_Cfx/Publish",
-        "05_Vfx",
-        "06_Lgt",
-        "07_Comp",
-        "08_Render",
-        "09_Assembly"
+        "Layout",
+        "Blocking",
+        "Anim",
+        "Cfx/_wip",
+        "Cfx/cache",
+        "Cfx/Publish",
+        "Vfx",
+        "Lgt",
+        "Comp",
+        "Render",
+        "Assembly"
     ]
     os.makedirs(base_path, exist_ok=True)
     for sub in sub_folders:
@@ -37,16 +37,16 @@ def create_shot_structure(base_path):
 def create_project_base(project_path):
     """Creates the top-level project folders."""
     folders = [
-        "00_References",
-        "01_Assets/01_Char",
-        "01_Assets/02_Props",
-        "01_Assets/03_Sets",
-        "01_Assets/04_Vehicles",
-        "02_Shots",
-        "03_SFX",
-        "04_FinalOutput/EXR",
-        "04_FinalOutput/MOV",
-        "05_ProjectConfig/ColorManagement"
+        "References",
+        "Assets/Char",
+        "Assets/Props",
+        "Assets/Sets",
+        "Assets/Vehicles",
+        "Shots",
+        "SFX",
+        "FinalOutput/EXR",
+        "FinalOutput/MOV",
+        "ProjectConfig/ColorManagement"
     ]
     for folder in folders:
         os.makedirs(os.path.join(project_path, folder), exist_ok=True)

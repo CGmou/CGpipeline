@@ -96,12 +96,23 @@ class ProjectSheet(QWidget):
         expanded_paths = self.get_expanded_state()
         self.tree.clear()
 
-        asset_map_rev = {
-            "01_Char": "Characters",
-            "02_Props": "Props",
-            "03_Sets": "Sets",
-            "04_Vehicles": "Vehicles"
+        group_display = {
+            "Char": "Characters",
+            "Props": "Props",
+            "Sets": "Sets",
+            "Vehicles": "Vehicles"
         }
+        
+        # Reverse mapping for display logic
+        asset_map_rev = {v: k for k, v in group_display.items()}
+        # Ensure it handles both ways just in case
+        asset_map_rev.update({
+            "Char": "Characters",
+            "Props": "Props",
+            "Sets": "Sets",
+            "Vehicles": "Vehicles"
+        })
+
 
         entities = {}
         for task in self.registry.tasks:

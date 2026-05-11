@@ -33,6 +33,13 @@ class Header(QWidget):
         self.project_name = QLabel(self.registry.data.get("project_name", "Unknown Project"))
         self.project_name.setObjectName("ProjectLabel")
         info_layout.addWidget(self.project_name)
+        
+        # Color Management Label
+        color_val = self.registry.data.get("color_management", "ACES 1.2")
+        self.color_label = QLabel(f"[{color_val}]")
+        self.color_label.setStyleSheet("color: #555; font-size: 11px; font-weight: bold; margin-left: 5px;")
+        info_layout.addWidget(self.color_label)
+
         separator = QLabel("|")
         separator.setStyleSheet("color: #333333; margin: 0 10px;")
         info_layout.addWidget(separator)
