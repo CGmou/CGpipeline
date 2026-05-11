@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "CGPipeline Blender Integration",
-    "author": "Daniel / Gemini CLI",
-    "version": (3, 1, 1),
-    "blender": (3, 0, 0),
+    "name": "CGPipeline",
+    "author": "Daniel Wee",
+    "version": (0, 0, 1),
+    "blender": (5, 1, 1),
     "location": "View3D > Sidebar > CGPipeline",
-    "description": "Full native pipeline Dashboard, Status, Publisher, and Refined Assembly suite.",
+    "description": "CGPipeline for management project",
     "category": "Pipeline",
 }
 
@@ -197,7 +197,7 @@ def cgp_load_post_handler(dummy):
 
 # --- OPERATORS (CORE) ---
 class CGP_OT_OpenDashboard(bpy.types.Operator):
-    bl_idname = 'cgp.open_dashboard'; bl_label = 'Open Dashboard'
+    bl_idname = 'cgp.open_dashboard'; bl_label = 'Open'
     def execute(self, context):
         try:
             # Find the main.py path
@@ -257,7 +257,7 @@ class CGP_OT_SaveVersion(bpy.types.Operator):
         except: return {'CANCELLED'}
 
 class CGP_OT_UpdateStatus(bpy.types.Operator):
-    bl_idname = 'cgp.update_status'; bl_label = 'Update Status'
+    bl_idname = 'cgp.update_status'; bl_label = 'Update'
     def execute(self, context):
         props = context.window_manager.cgp_props
         reg, tid = props.active_reg_path or os.environ.get('CGP_REGISTRY_PATH'), props.active_task_id or os.environ.get('CGP_TASK_ID')
@@ -493,17 +493,17 @@ class CGP_OT_AssemblyApply(bpy.types.Operator):
 class CGP_PT_MainPanel(bpy.types.Panel):
     bl_label = 'CGPipeline'; bl_idname = 'CGP_PT_MainPanel'; bl_space_type = 'VIEW_3D'; bl_region_type = 'UI'; bl_category = 'CGPipeline'
     def draw(self, context):
-        l = self.layout; l.operator('cgp.open_dashboard', text='Open Dashboard', icon='WINDOW')
+        l = self.layout; l.operator('cgp.open_dashboard', text='Open', icon='WINDOW')
         l.separator(); l.label(text="Quick Tools:"); row = l.row(align=True); row.operator('cgp.normal_save', icon='FILE_TICK'); row.operator('cgp.save_version', icon='FILE_NEW')
 
 class CGP_PT_StatusPanel(bpy.types.Panel):
-    bl_label = 'CGPipeline Status'; bl_idname = 'CGP_PT_StatusPanel'; bl_space_type = 'VIEW_3D'; bl_region_type = 'UI'; bl_category = 'CGPipeline'
+    bl_label = 'Status'; bl_idname = 'CGP_PT_StatusPanel'; bl_space_type = 'VIEW_3D'; bl_region_type = 'UI'; bl_category = 'CGPipeline'
     def draw(self, context):
         l, p = self.layout, context.window_manager.cgp_props; e = p.active_entity or "None"
         l.label(text=f"TASK: {e}", icon='INFO'); box = l.box(); row = box.row(align=True); row.prop(p, 'status_enum', text=""); row.operator('cgp.update_status', icon='FILE_REFRESH')
 
 class CGP_PT_PublishPanel(bpy.types.Panel):
-    bl_label = 'CGPipeline Publisher'; bl_idname = 'CGP_PT_PublishPanel'; bl_space_type = 'VIEW_3D'; bl_region_type = 'UI'; bl_category = 'CGPipeline'
+    bl_label = 'Publisher'; bl_idname = 'CGP_PT_PublishPanel'; bl_space_type = 'VIEW_3D'; bl_region_type = 'UI'; bl_category = 'CGPipeline'
     def draw(self, context):
         l, p = self.layout, context.window_manager.cgp_props; e = p.active_entity or "None"
         l.label(text=f'PUBLISHING: {e}'); b = l.box(); col = b.column(align=True)
@@ -515,11 +515,11 @@ class CGP_PT_PublishPanel(bpy.types.Panel):
         l.separator(); l.operator('cgp.publish_action', text='PUBLISH', icon='EXPORT')
 
 class CGP_PT_AssemblyPanel(bpy.types.Panel):
-    bl_label = 'CGPipeline Assembly'; bl_idname = 'CGP_PT_AssemblyPanel'; bl_space_type = 'VIEW_3D'; bl_region_type = 'UI'; bl_category = 'CGPipeline'
+    bl_label = 'Assembly'; bl_idname = 'CGP_PT_AssemblyPanel'; bl_space_type = 'VIEW_3D'; bl_region_type = 'UI'; bl_category = 'CGPipeline'
     def draw(self, context):
         l, p = self.layout, context.window_manager.cgp_props; l.operator("cgp.assembly_scan", icon='FILE_REFRESH', text="1. REFRESH")
         b = l.box(); b.label(text="2. IMPORT LOOKDEV:", icon='MATERIAL'); b.template_list("CGP_UL_LookdevList", "lkdev", p, "lookdev_items", p, "lookdev_index")
-        r = b.row(align=True); r.prop(p, 'import_mode', text=""); r.operator("cgp.assembly_import_lkdev", text="IMPORT", icon='IMPORT')
+        r = b.row(align=True); r.prop(p, 'import_mode', text=""); r.operator("cgp.assembly_import_lkdev", text="LINK", icon='IMPORT')
         l.separator(); l.operator("cgp.assembly_make_override", text="3. MAKE OVERRIDE", icon='LIBRARY_DATA_OVERRIDE')
         b = l.box(); b.label(text="4. ASSIGN CACHES:", icon='LINKED'); b.template_list("CGP_UL_CollectionLinkList", "links", p, "collection_links", p, "collection_index")
         row = b.row(align=True); row.scale_y = 1.2
