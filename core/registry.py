@@ -12,6 +12,7 @@ class TaskRegistry:
         self.data = {
             "project_name": "New Project",
             "current_user": "Artist",
+            "color_management": "ACES 1.2",
             "tasks": []
         }
         self.load()
@@ -22,6 +23,11 @@ class TaskRegistry:
                 with open(self.registry_file, "r") as f:
                     self.data.update(json.load(f))
                 needs_save = False
+                
+                # Ensure color_management exists
+                if "color_management" not in self.data:
+                    self.data["color_management"] = "ACES 1.2"; needs_save = True
+
                 for task in self.data["tasks"]:
                     if "category" not in task:
                         task["category"] = "Assets"; needs_save = True
@@ -34,7 +40,7 @@ class TaskRegistry:
                     old_path = task.get("path", "")
                     if old_path and not os.path.exists(old_path):
                         parts = old_path.replace("\\", "/").split("/")
-                        for marker in ["01_Assets", "02_Shots"]:
+                        for marker in ["Assets", "Shots"]:
                             if marker in parts:
                                 idx = parts.index(marker)
                                 rel_path = os.path.join(*parts[idx:])
@@ -76,9 +82,9 @@ class TaskRegistry:
         clean_name = name.replace(" ", "_")
         entity_rel_path = ""
         if category == "Assets":
-            entity_rel_path = os.path.join("01_Assets", sub_category, clean_name)
+            entity_rel_path = os.path.join("Assets", sub_category, clean_name)
         else:
-            entity_rel_path = os.path.join("02_Shots", clean_name)
+            entity_rel_path = os.path.join("Shots", clean_name)
         entity_full_path = os.path.normpath(os.path.join(self.root_path, entity_rel_path))
 
         if category == "Assets": create_asset_structure(entity_full_path)
@@ -86,9 +92,9 @@ class TaskRegistry:
 
         dept_map = {
             "Model": "Model/_wip", "Texture": "Textures/_wip", "Lookdev": "Lookdev/_wip",
-            "Rig": "Rig/_wip", "Animation": "03_Anim", "Blocking": "02_Blocking",
-            "Lighting": "06_Lgt", "FX": "05_Vfx", "Comp": "07_Comp",
-            "Layout": "01_Layout", "CFX": "04_Cfx/_wip", "Assembly": "09_Assembly", "Setdress": "01_Layout"
+            "Rig": "Rig/_wip", "Animation": "Anim", "Blocking": "Blocking",
+            "Lighting": "Lgt", "FX": "Vfx", "Comp": "Comp",
+            "Layout": "Layout", "CFX": "Cfx/_wip", "Assembly": "Assembly", "Setdress": "Layout"
         }
         dept_sub = dept_map.get(task_type, "")
         task_path = os.path.normpath(os.path.join(entity_full_path, dept_sub))

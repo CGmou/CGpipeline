@@ -164,7 +164,9 @@ class CGP_WindowManagerProps(bpy.types.PropertyGroup):
 # --- UI LISTS ---
 class CGP_UL_PublishList(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        layout.label(text=item.name, icon='OBJECT_DATAMODE')
+        # Determine icon (Collection vs Object)
+        disp_icon = 'OUTLINER_COLLECTION' if item.name in bpy.data.collections else 'OBJECT_DATAMODE'
+        layout.label(text=item.name, icon=disp_icon)
 
 class CGP_UL_LookdevList(bpy.types.UIList):
     def draw_item(self, c, l, d, item, i, ad, ap, idx):
@@ -194,8 +196,147 @@ def cgp_load_post_handler(dummy):
         props.active_task_path = os.environ.get('CGP_TASK_PATH', '').strip()
         props.active_task_type = os.environ.get('CGP_TASK_TYPE', '').strip()
         props.active_category = os.environ.get('CGP_CATEGORY', '').strip()
+    
+    # Force relative paths for everything in this file
+    try:
+        bpy.ops.file.make_paths_relative()
+    except: pass
 
 # --- OPERATORS (CORE) ---
+class CGP_OT_FixTexturePaths(bpy.types.Operator):
+    bl_idname = "cgp.fix_texture_paths"; bl_label = "Fix Missing Textures"
+    bl_description = "Searches for missing textures linked to selected objects and re-links them"
+
+    def execute(self, context):
+        props = context.window_manager.cgp_props
+        reg = props.active_reg_path or os.environ.get('CGP_REGISTRY_PATH')
+        if not reg:
+            self.report({'ERROR'}, "Project root not detected. Open via Dashboard first.")
+            return {'CANCELLED'}
+        
+        if not context.selected_objects:
+            self.report({'WARNING'}, "Please select objects to fix textures for.")
+            return {'CANCELLED'}
+
+        project_root = os.path.dirname(reg)
+        count = 0
+        missing = []
+
+        # Find all unique images linked to selected objects
+        target_images = set()
+        for obj in context.selected_objects:
+            for slot in obj.material_slots:
+                if slot.material and slot.material.use_nodes:
+                    for node in slot.material.node_tree.nodes:
+                        if node.type == 'TEX_IMAGE' and node.image:
+                            target_images.add(node.image)
+
+        if not target_images:
+            self.report({'INFO'}, "No image textures found on selected objects.")
+            return {'FINISHED'}
+
+        # Process the collected images
+        for img in target_images:
+            if img.source != 'FILE' or not img.filepath: continue
+            
+            # Check if path is already valid
+            abs_path = bpy.path.abspath(img.filepath)
+            if os.path.exists(abs_path): continue
+
+            # It's missing, try to find it in the project root
+            filename = os.path.basename(img.filepath)
+            found = False
+            
+            # Walk through Assets and Textures folders specifically for speed
+            search_dirs = [
+                os.path.join(project_root, "Assets"),
+                os.path.join(project_root, "Textures"),
+                project_root
+            ]
+            
+            for s_dir in search_dirs:
+                if not os.path.exists(s_dir): continue
+                for root, dirs, files in os.walk(s_dir):
+                    if filename in files:
+                        new_path = os.path.join(root, filename)
+                        img.filepath = bpy.path.relpath(new_path)
+                        count += 1
+                        found = True
+                        break
+                if found: break
+            
+            if not found: missing.append(filename)
+
+        if count > 0:
+            self.report({'INFO'}, f"Successfully re-linked {count} textures for selected objects.")
+        if missing:
+            self.report({'WARNING'}, f"Could not find {len(missing)} textures in project.")
+        
+        return {'FINISHED'}
+
+class CGP_OT_SwitchTextureRes(bpy.types.Operator):
+    bl_idname = "cgp.switch_texture_res"; bl_label = "Switch Texture Resolution"
+    res: bpy.props.StringProperty()
+
+    def execute(self, context):
+        target_res = self.res.lower() # "2k" or "4k"
+        other_res = "4k" if target_res == "2k" else "2k"
+        
+        # 1. Gather all objects (Selected + Objects in Selected Collections)
+        target_objs = set(context.selected_objects)
+        
+        # Add objects from selected collections in Outliner
+        if hasattr(context, 'selected_ids'):
+            for item in context.selected_ids:
+                if isinstance(item, bpy.types.Collection):
+                    for obj in item.all_objects: target_objs.add(obj)
+
+        # IMPORTANT: If an object is a collection instance, add all objects inside that collection
+        for obj in list(target_objs):
+            if obj.instance_type == 'COLLECTION' and obj.instance_collection:
+                for sub_obj in obj.instance_collection.all_objects:
+                    target_objs.add(sub_obj)
+
+        if not target_objs:
+            self.report({'WARNING'}, "Please select objects or a collection first.")
+            return {'CANCELLED'}
+
+        # 2. Find all unique images
+        target_images = set()
+        for obj in target_objs:
+            for slot in obj.material_slots:
+                if slot.material and slot.material.use_nodes:
+                    for node in slot.material.node_tree.nodes:
+                        if node.type == 'TEX_IMAGE' and node.image:
+                            target_images.add(node.image)
+
+        count = 0
+        for img in target_images:
+            if img.source != 'FILE' or not img.filepath: continue
+            
+            # Simple aggressive replacement
+            old_path = img.filepath
+            # Replace /2k/ with /4k/ or \2k\ with \4k\ etc (Case Insensitive)
+            new_path = old_path
+            
+            # Try various common separators to find the resolution folder
+            for sep in ['/', '\\']:
+                marker = f"{sep}{other_res}{sep}"
+                if marker.lower() in old_path.lower():
+                    # Find the actual casing used in the path
+                    idx = old_path.lower().find(marker.lower())
+                    new_path = old_path[:idx] + sep + target_res + old_path[idx+len(marker)-1:]
+                    break
+            
+            if new_path != old_path:
+                img.filepath = new_path
+                img.reload()
+                count += 1
+                print(f"CGPipeline: Switched {img.name} -> {target_res.upper()}")
+
+        self.report({'INFO'}, f"Directly switched {count} textures to {target_res.upper()}.")
+        return {'FINISHED'}
+
 class CGP_OT_OpenDashboard(bpy.types.Operator):
     bl_idname = 'cgp.open_dashboard'; bl_label = 'Open'
     def execute(self, context):
@@ -274,9 +415,35 @@ class CGP_OT_AddSelected(bpy.types.Operator):
     bl_idname = 'cgp.add_selected'; bl_label = 'Add Selected'
     def execute(self, context):
         props = context.window_manager.cgp_props
+        
+        # 1. Add Selected Objects (Viewport)
         for obj in context.selected_objects:
             if not any(i.name == obj.name for i in props.publish_list):
                 item = props.publish_list.add(); item.name = obj.name
+        
+        # 2. Add Active Collection (The one highlighted in the Outliner)
+        # This is the most reliable way to get a collection from the Sidebar
+        active_lc = context.view_layer.active_layer_collection
+        if active_lc and active_lc.collection:
+            coll = active_lc.collection
+            # Only add if it's not the Scene Collection (usually don't want to export everything)
+            if coll != context.scene.collection:
+                if not any(i.name == coll.name for i in props.publish_list):
+                    list_item = props.publish_list.add()
+                    list_item.name = coll.name
+                    self.report({'INFO'}, f"Added collection: {coll.name}")
+
+        # 3. Fallback: If no objects selected but user is highlighting a collection
+        # Check 'selected_ids' via a simpler context check if visible
+        try:
+            outliner = next((a for a in context.screen.areas if a.type == 'OUTLINER'), None)
+            if outliner:
+                for s_id in context.selected_ids:
+                    if isinstance(s_id, bpy.types.Collection):
+                        if not any(i.name == s_id.name for i in props.publish_list):
+                            item = props.publish_list.add(); item.name = s_id.name
+        except: pass
+        
         return {'FINISHED'}
 
 class CGP_OT_RemoveObject(bpy.types.Operator):
@@ -300,8 +467,14 @@ class CGP_OT_PublishAction(bpy.types.Operator):
         range_suffix = f'_f{s}_f{ef}'
         def do_export(objs, filename, is_camera=False):
             bpy.ops.object.select_all(action='DESELECT')
-            for o in objs: 
-                if o in bpy.data.objects: bpy.data.objects[o].select_set(True)
+            for o in objs:
+                if o in bpy.data.objects:
+                    bpy.data.objects[o].select_set(True)
+                elif o in bpy.data.collections:
+                    # If it's a collection, select all its objects
+                    for co in bpy.data.collections[o].all_objects:
+                        co.select_set(True)
+            
             bpy.context.view_layer.update(); f_path = os.path.normpath(os.path.join(pub, filename))
             if fmt == '.abc': bpy.ops.wm.alembic_export(filepath=f_path, selected=True, start=s, end=ef)
             elif fmt == '.usd':
@@ -327,13 +500,29 @@ class CGP_OT_PublishAction(bpy.types.Operator):
         try:
             if props.publish_separate:
                 for i in props.publish_list:
+                    # Check if it's an object or collection for naming
                     obj = bpy.data.objects.get(i.name)
-                    if not obj: continue
-                    is_c = (obj.type == 'CAMERA' or 'cam' in obj.name.lower())
-                    fn = f'{e}_cam_f{s}_f{ef}{fmt}' if is_c else f'{e}_{abbr}_{i.name}{fmt}'
+                    coll = bpy.data.collections.get(i.name)
+                    
+                    if not obj and not coll: continue
+                    
+                    is_c = obj and (obj.type == 'CAMERA' or 'cam' in obj.name.lower())
+                    
+                    # Naming Logic: Lookdev Special Case
+                    if t == 'Lookdev' and fmt in {'.usd', '.blend'}:
+                        fn = f'{e}_lkdev{fmt}' if not props.publish_separate else f'{e}_lkdev_{i.name}{fmt}'
+                    else:
+                        fn = f'{e}_cam_f{s}_f{ef}{fmt}' if is_c else f'{e}_{abbr}_{i.name}{fmt}'
+                    
                     do_export([i.name], fn, is_camera=is_c)
             else:
-                fn = f'{e}_{abbr}{fmt}' if c == 'Assets' else f'{e}{fmt}'; do_export([i.name for i in props.publish_list], fn)
+                # Naming Logic: Lookdev Special Case for batch export
+                if t == 'Lookdev' and fmt in {'.usd', '.blend'}:
+                    fn = f'{e}_lkdev{fmt}'
+                else:
+                    fn = f'{e}_{abbr}{fmt}' if c == 'Assets' else f'{e}{fmt}'
+                
+                do_export([i.name for i in props.publish_list], fn)
             return {'FINISHED'}
         except: return {'CANCELLED'}
 
@@ -344,7 +533,9 @@ class CGP_OT_AssemblyScan(bpy.types.Operator):
         props = context.window_manager.cgp_props; reg = props.active_reg_path or os.environ.get('CGP_REGISTRY_PATH')
         if not reg: return {'CANCELLED'}
         root = os.path.dirname(reg); props.lookdev_items.clear(); props.cache_items.clear()
-        assets_dir = os.path.join(root, "01_Assets")
+        
+        # 1. SCAN LOOKDEV: Search Assets -> Category -> Asset -> Publish for *_lkdev.blend
+        assets_dir = os.path.join(root, "Assets")
         if os.path.exists(assets_dir):
             for cat in os.listdir(assets_dir):
                 cat_p = os.path.join(assets_dir, cat)
@@ -352,22 +543,48 @@ class CGP_OT_AssemblyScan(bpy.types.Operator):
                 for asset in os.listdir(cat_p):
                     asset_p = os.path.join(cat_p, asset)
                     if not os.path.isdir(asset_p): continue
-                    for sub in ["", "Lookdev", "Publish", "lkdev"]:
-                        folder = os.path.join(asset_p, sub) if sub else asset_p
-                        if not os.path.isdir(folder): continue
-                        for f in os.listdir(folder):
-                            f_low = f.lower()
-                            if (('lookdev' in f_low) or ('lkdev' in f_low)) and f.endswith('.blend'):
-                                item = props.lookdev_items.add(); item.name = f; item.path = os.path.join(folder, f); item.asset_name = asset
+                    
+                    # Look inside Publish folder for _lkdev files
+                    pub_folder = os.path.join(asset_p, "Publish")
+                    if os.path.isdir(pub_folder):
+                        for f in os.listdir(pub_folder):
+                            if '_lkdev' in f.lower() and f.endswith('.blend'):
+                                item = props.lookdev_items.add()
+                                item.name = f; item.path = os.path.join(pub_folder, f); item.asset_name = asset
+
+        # 2. SCAN CACHES: Search current Shot -> Dept -> Publish for *_anim_* (abc/usd)
         p = props.active_task_path or os.environ.get('CGP_TASK_PATH', '').strip()
         if p:
-            shot_root = os.path.dirname(p)
-            for sub in ["03_Anim", "Animation", "Anim", "02_Blocking", "Blocking"]:
-                shot_pub = os.path.join(shot_root, sub, "Publish")
-                if os.path.isdir(shot_pub):
-                    for f in os.listdir(shot_pub):
-                        if f.lower().endswith(('.abc','.usd','.usda','.usdc','.fbx')):
-                            item = props.cache_items.add(); item.name = f
+            # 1. Identify the Shot Root
+            # Path is usually: .../Shots/SH01_SQ0010/Anim/_wip
+            norm_p = os.path.normpath(p).replace('\\', '/')
+            parts = norm_p.split('/')
+            shot_root = ""
+            
+            if "Shots" in parts:
+                idx = parts.index("Shots")
+                if len(parts) > idx + 1:
+                    # shot_root is .../Shots/SH01_SQ0010
+                    shot_root = os.path.normpath("/".join(parts[:idx+2]))
+            
+            if shot_root and os.path.exists(shot_root):
+                print(f"CGPipeline: Scanning for caches in shot: {shot_root}")
+                # Departments to check for publishes
+                for dept in ["Anim", "Animation", "Blocking", "Layout", "lo"]:
+                    dept_pub = os.path.normpath(os.path.join(shot_root, dept, "Publish"))
+                    if os.path.isdir(dept_pub):
+                        print(f"CGPipeline: Checking publish folder: {dept_pub}")
+                        for f in os.listdir(dept_pub):
+                            f_low = f.lower()
+                            # Search for files with _anim_ marker in the filename
+                            if '_anim_' in f_low and f_low.endswith(('.abc', '.usd', '.usdc', '.usda')):
+                                if not any(i.name == f for i in props.cache_items):
+                                    item = props.cache_items.add()
+                                    item.name = f
+                                    print(f"CGPipeline: Found cache: {f}")
+            else:
+                print(f"CGPipeline Debug: Could not resolve shot root from path: {p}")
+        
         existing = {l.name: l.assigned_cache for l in props.collection_links}
         props.collection_links.clear()
         for coll in context.scene.collection.children:
@@ -473,7 +690,7 @@ class CGP_OT_AssemblyApply(bpy.types.Operator):
         for l in links:
             if not l.assigned_cache: continue
             fp = None
-            for sub in ["03_Anim", "Animation", "Anim", "02_Blocking", "Blocking"]:
+            for sub in ["Anim", "Animation", "Blocking"]:
                 test_p = os.path.normpath(os.path.join(shot_root, sub, "Publish", l.assigned_cache))
                 if os.path.exists(test_p): fp = test_p; break
             if not fp: continue
@@ -495,6 +712,14 @@ class CGP_PT_MainPanel(bpy.types.Panel):
     def draw(self, context):
         l = self.layout; l.operator('cgp.open_dashboard', text='Open', icon='WINDOW')
         l.separator(); l.label(text="Quick Tools:"); row = l.row(align=True); row.operator('cgp.normal_save', icon='FILE_TICK'); row.operator('cgp.save_version', icon='FILE_NEW')
+        l.operator('cgp.fix_texture_paths', text='Fix Missing Textures', icon='FILE_REFRESH')
+        
+        # Texture Resolution Switcher
+        row = l.row(align=True)
+        op2 = row.operator('cgp.switch_texture_res', text='2K', icon='IMAGE_DATA')
+        op2.res = "2k"
+        op4 = row.operator('cgp.switch_texture_res', text='4K', icon='IMAGE_DATA')
+        op4.res = "4k"
 
 class CGP_PT_StatusPanel(bpy.types.Panel):
     bl_label = 'Status'; bl_idname = 'CGP_PT_StatusPanel'; bl_space_type = 'VIEW_3D'; bl_region_type = 'UI'; bl_category = 'CGPipeline'
@@ -509,7 +734,12 @@ class CGP_PT_PublishPanel(bpy.types.Panel):
         l.label(text=f'PUBLISHING: {e}'); b = l.box(); col = b.column(align=True)
         r = col.row(align=True); r.prop(p, 'format_enum', text=""); r.prop(p, 'range_mode', text="")
         if p.range_mode == 'CUSTOM': r = col.row(align=True); r.prop(p, 'start_frame', text="S"); r.prop(p, 'end_frame', text="E")
-        col.separator(); r = col.row(align=True); r.prop(p, 'publish_separate', text="Separate"); r.prop(p, 'include_materials', text="Material")
+        col.separator(); r = col.row(align=True); r.prop(p, 'publish_separate', text="Separate")
+        
+        # Only show Material checker for USD and Blender modes
+        if p.format_enum in {'.usd', '.blend'}:
+            r.prop(p, 'include_materials', text="Material")
+            
         col.separator(); col.label(text="Selection List:"); col.template_list('CGP_UL_PublishList', '', p, 'publish_list', p, 'publish_list_index')
         r = col.row(align=True); r.operator('cgp.add_selected', text='Add', icon='ADD'); r.operator('cgp.remove_object', text='Remove', icon='REMOVE')
         l.separator(); l.operator('cgp.publish_action', text='PUBLISH', icon='EXPORT')
@@ -538,7 +768,7 @@ classes = [
     CGP_ObjectItem, CGP_CacheFileItem, CGP_LookdevFileItem, CGP_CollectionLink, CGP_WindowManagerProps,
     CGP_UL_PublishList, CGP_UL_LookdevList, CGP_UL_CollectionLinkList,
     CGP_OT_OpenDashboard, CGP_OT_NormalSave, CGP_OT_SaveVersion, CGP_OT_UpdateStatus,
-    CGP_OT_AddSelected, CGP_OT_RemoveObject, CGP_OT_PublishAction,
+    CGP_OT_AddSelected, CGP_OT_RemoveObject, CGP_OT_PublishAction, CGP_OT_FixTexturePaths, CGP_OT_SwitchTextureRes,
     CGP_OT_AssemblyScan, CGP_OT_AssemblyImportLookdev, CGP_OT_AssemblyMakeOverride, 
     CGP_OT_AssemblyAssignPopup, CGP_OT_AssemblySetCache, CGP_OT_AssemblyApply,
     CGP_PT_MainPanel, CGP_PT_StatusPanel, CGP_PT_PublishPanel, CGP_PT_AssemblyPanel, CGP_MT_AssignMenu

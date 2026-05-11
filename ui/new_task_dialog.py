@@ -57,10 +57,10 @@ class NewTaskDialog(QDialog):
         """)
         self.category = "Assets"
         self.asset_map = {
-            "Character": "01_Char",
-            "Prop": "02_Props",
-            "Set": "03_Sets",
-            "Vehicle": "04_Vehicles"
+            "Character": "Char",
+            "Prop": "Props",
+            "Set": "Sets",
+            "Vehicle": "Vehicles"
         }
         self.thumbnail_path = ""
         self.asset_types = ["Model", "Texture", "Lookdev", "Rig"]

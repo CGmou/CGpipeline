@@ -74,6 +74,13 @@ class CGPipelineApp(QMainWindow):
     def on_project_selected(self, project_data):
         self.auth.save_active_project(project_data["path"])
         self.workspace_view = WorkspaceView(project_data["path"], self.auth)
+        
+        # Sync color management from hub to registry if needed
+        if "color_management" in project_data:
+            self.workspace_view.registry.data["color_management"] = project_data["color_management"]
+            self.workspace_view.registry.save()
+            self.workspace_view.header.color_label.setText(f"[{project_data['color_management']}]")
+            
         self.workspace_view.exit_requested.connect(self.show_hub)
         self.workspace_view.logout_requested.connect(self.show_login)
         self.stack.addWidget(self.workspace_view)

@@ -1,9 +1,10 @@
 ﻿import os
 import re
 
-ASSET_PREFIX = {
-    "01_Char": "CH", "02_Props": "PR", "03_Sets": "ST", "04_Vehicles": "VH"
+ASSET_GROUP_ABBR = {
+    "Char": "CH", "Props": "PR", "Sets": "ST", "Vehicles": "VH"
 }
+
 TASK_ABBR = {
     "Model": "mdl", "Texture": "txt", "Shader": "shd", "Rig": "rig",
     "Animation": "anim", "Layout": "lo", "Blocking": "blk", "Lighting": "lgt",
