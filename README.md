@@ -1,6 +1,6 @@
 # CGPipeline: The Artist Dashboard
 
-CGPipeline is a task-centric VFX/CG pipeline manager designed for speed and simplicity.
+CGPipeline is a task-centric VFX/CG pipeline manager designed for speed and simplicity and cross multi Platform like Windows and MacOS.
 
 ## Core Philosophy
 1. **Flat UI:** No folder trees. Tasks are presented as cards.
