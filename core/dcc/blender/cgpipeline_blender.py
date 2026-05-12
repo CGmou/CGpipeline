@@ -648,10 +648,11 @@ class CGP_OT_AssemblyScan(bpy.types.Operator):
                         for f in os.listdir(pub_dir):
                             f_low = f.lower()
                             if f_low.endswith(('.abc', '.usd', '.usdc', '.usda', '.fbx')):
-                                # Apply "Anim Only" filter if enabled
-                                if props.cache_anim_only and '_anim_' not in f_low:
-                                    continue
-                                
+                                # Apply "Anim Only" filter if enabled: strictly look for '_anim_'
+                                if props.cache_anim_only:
+                                    if '_anim_' not in f_low:
+                                        continue
+
                                 if not any(i.name == f for i in props.cache_items):
                                     item = props.cache_items.add()
                                     item.name = f
