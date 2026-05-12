@@ -6,7 +6,7 @@ ASSET_GROUP_ABBR = {
 }
 
 TASK_ABBR = {
-    "Model": "mdl", "Texture": "txt", "Shader": "shd", "Rig": "rig",
+    "Model": "mdl", "Texture": "txt", "Lookdev": "lkdev", "Rig": "rig",
     "Animation": "anim", "Layout": "lo", "Blocking": "blk", "Lighting": "lgt",
     "Comp": "comp", "FX": "fx", "CFX": "cfx", "Assembly": "asb", "Setdress": "sd"
 }

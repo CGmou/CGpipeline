@@ -9,7 +9,7 @@ def create_asset_structure(base_path):
         "Textures/_wip",
         "Model/_wip",
         "Rig/_wip",
-        "Shader/_wip"
+        "Lookdev/_wip"
     ]
     os.makedirs(base_path, exist_ok=True)
     for sub in sub_folders:

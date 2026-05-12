@@ -640,10 +640,14 @@ class CGP_OT_AssemblyScan(bpy.types.Operator):
             else:
                 print(f"CGPipeline Debug: Could not resolve shot root from path: {p}")
         
-        existing = {l.name: l.assigned_cache for l in props.collection_links}
+        existing = {l.name: (l.assigned_cache, l.is_selected) for l in props.collection_links}
         props.collection_links.clear()
         for coll in context.scene.collection.children:
-            l = props.collection_links.add(); l.name = coll.name; l.assigned_cache = existing.get(coll.name, "")
+            l = props.collection_links.add()
+            l.name = coll.name
+            cache, selected = existing.get(coll.name, ("", True))
+            l.assigned_cache = cache
+            l.is_selected = selected
         return {'FINISHED'}
 
 class CGP_OT_AssemblyImportLookdev(bpy.types.Operator):
@@ -750,8 +754,11 @@ class CGP_OT_AssemblyApply(bpy.types.Operator):
         if not shot_root: return {'CANCELLED'}
             
         links = props.collection_links if self.batch else [l for l in props.collection_links if l.is_selected]
+        print(f"CGPipeline: Applying Caches (batch={self.batch}, count={len(links)})")
+        
         for l in links:
             if not l.assigned_cache: continue
+            print(f"CGPipeline:   - Processing Collection: {l.name} with cache {l.assigned_cache}")
             fp = None
             # Search in all department publish folders for the assigned filename
             for dept in os.listdir(shot_root):
