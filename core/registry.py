@@ -12,7 +12,7 @@ class TaskRegistry:
         self.data = {
             "project_name": "New Project",
             "current_user": "Artist",
-            "color_management": "ACES 1.2",
+            "color_management": "ACES 1.3",
             "tasks": []
         }
         self.load()
@@ -26,7 +26,7 @@ class TaskRegistry:
                 
                 # Ensure color_management exists
                 if "color_management" not in self.data:
-                    self.data["color_management"] = "ACES 1.2"; needs_save = True
+                    self.data["color_management"] = "ACES 1.3"; needs_save = True
 
                 for task in self.data["tasks"]:
                     if "category" not in task:

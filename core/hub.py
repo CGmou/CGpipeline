@@ -60,7 +60,7 @@ class HubManager:
         except Exception as e:
             print(f"CGPipeline Error: Failed to save index to {self.index_file}: {e}")
 
-    def create_project(self, name, root_dir, thumbnail="", fps=24, color_management="ACES 1.2"):
+    def create_project(self, name, root_dir, thumbnail="", fps=24, color_management="ACES 1.3"):
         # Use the provided root_dir if different from self.project_root, 
         # but usually they should match in this new architecture.
         active_root = root_dir if root_dir else self.project_root

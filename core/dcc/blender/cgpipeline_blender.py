@@ -215,6 +215,24 @@ def cgp_load_post_handler(dummy):
         props.active_task_type = os.environ.get('CGP_TASK_TYPE', '').strip()
         props.active_category = os.environ.get('CGP_CATEGORY', '').strip()
     
+    # --- AUTO COLOR MANAGEMENT ---
+    reg_path = props.active_reg_path
+    if reg_path and os.path.exists(reg_path):
+        try:
+            with open(reg_path, 'r') as f:
+                data = json.load(f)
+                cm = data.get("color_management", "")
+                if cm in ["ACES 1.3", "ACES 2.0"]:
+                    # Set Sequencer to ACEScg
+                    if hasattr(bpy.context.scene, "sequencer_colorspace_settings"):
+                        try:
+                            bpy.context.scene.sequencer_colorspace_settings.name = "ACEScg"
+                            print(f"CGPipeline: Color Management set to {cm} (Sequencer: ACEScg)")
+                        except:
+                            print("CGPipeline Warning: Failed to set Sequencer color space to ACEScg. Is the OCIO config loaded?")
+        except Exception as e:
+            print(f"CGPipeline: Failed to read registry for color management: {e}")
+
     # Force relative paths for everything in this file
     try:
         bpy.ops.file.make_paths_relative()

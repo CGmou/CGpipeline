@@ -41,7 +41,7 @@ class ProjectCard(QFrame):
         name.setWordWrap(True)
         layout.addWidget(name)
         
-        info = QLabel(str(self.project_data.get("fps", 24)) + " fps | " + str(self.project_data.get("color_management", "ACES 1.2")))
+        info = QLabel(str(self.project_data.get("fps", 24)) + " fps | " + str(self.project_data.get("color_management", "ACES 1.3")))
         info.setStyleSheet("color: #888; font-size: 10px;")
         layout.addWidget(info)
         
@@ -243,9 +243,9 @@ class ProjectHubView(QWidget):
         layout.addRow("FPS:", fps_spin)
         
         color_combo = QComboBox()
-        color_combo.addItems(["ACES 1.2", "ACES 1.3", "Legacy sRGB", "Custom"])
+        color_combo.addItems(["ACES 1.3", "ACES 2.0", "Legacy sRGB", "Custom"])
         if project_data:
-            color_combo.setCurrentText(project_data.get("color_management", "ACES 1.2"))
+            color_combo.setCurrentText(project_data.get("color_management", "ACES 1.3"))
         layout.addRow("Color Management:", color_combo)
 
         thumb_path = [project_data["thumbnail"] if project_data else ""]
