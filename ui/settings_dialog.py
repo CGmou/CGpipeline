@@ -66,11 +66,7 @@ class DCCPathsDialog(QDialog):
             #SaveBtn { background-color: #0078D4; font-weight: bold; }
         """)
 
-        self.paths = self.auth.settings.get("dcc_paths", {
-            "Maya": "",
-            "Blender": "",
-            "Houdini": ""
-        })
+        self.paths = self.auth.dcc_paths
         self.setup_ui()
 
     def setup_ui(self):
@@ -80,7 +76,7 @@ class DCCPathsDialog(QDialog):
         layout.addWidget(QLabel("DCC EXECUTABLES"))
         dcc_form = QFormLayout()
         self.edits = {}
-        for dcc in ["Blender"]:
+        for dcc in ["Maya", "Blender", "Houdini"]:
             row = QHBoxLayout()
             edit = QLineEdit(self.paths.get(dcc, ""))
             self.edits[dcc] = edit
@@ -102,7 +98,7 @@ class DCCPathsDialog(QDialog):
     def browse(self, dcc, edit):
         import platform
         if platform.system() == "Windows":
-            filter_str = "Executable (*.exe)"
+            filter_str = "Executable (*.exe);;All Files (*)"
         elif platform.system() == "Darwin":
             filter_str = "Application (*.app);;All Files (*)"
         else:
@@ -114,8 +110,6 @@ class DCCPathsDialog(QDialog):
 
     def save(self):
         new_paths = {d: e.text() for d, e in self.edits.items()}
-        settings = self.auth.settings.copy()
-        settings["dcc_paths"] = new_paths
-        self.auth.settings = settings
-        self.auth.save_settings(settings.get("last_user", ""), settings.get("last_pass", ""), settings.get("remember", False))
+        self.auth.dcc_paths = new_paths
+        self.auth.save_settings(self.auth.settings.get("last_user", ""), self.auth.settings.get("last_pass", ""), self.auth.settings.get("remember", False))
         self.accept()

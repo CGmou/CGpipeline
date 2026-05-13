@@ -73,26 +73,54 @@ class AuthManager:
         self.current_user = None
 
     def load_settings(self):
+        default_settings = {
+            "last_user": "", 
+            "last_pass": "", 
+            "remember": False, 
+            "project_root": "", 
+            "dcc_paths_win": {"Maya": "", "Blender": "", "Houdini": ""},
+            "dcc_paths_mac": {"Maya": "", "Blender": "", "Houdini": ""}
+        }
+        
         if os.path.exists(self.settings_file):
             try:
                 with open(self.settings_file, "r") as f:
                     settings = json.load(f)
                     
-                    # Cross-platform fix for DCC paths
-                    if "dcc_paths" in settings:
+                    # Migration: if old dcc_paths exists, move it to the correct platform
+                    if "dcc_paths" in settings and "dcc_paths_win" not in settings:
                         import platform
-                        is_windows = platform.system() == "Windows"
-                        for dcc, path in settings["dcc_paths"].items():
-                            if path:
-                                # If it looks like a macOS path but we are on Windows
-                                if is_windows and path.startswith("/") and not path.startswith("\\\\"):
-                                    settings["dcc_paths"][dcc] = "" # Reset invalid path
-                                # If it looks like a Windows path but we are on macOS
-                                elif not is_windows and ":" in path:
-                                    settings["dcc_paths"][dcc] = "" # Reset invalid path
+                        if platform.system() == "Windows":
+                            settings["dcc_paths_win"] = settings.pop("dcc_paths")
+                            settings["dcc_paths_mac"] = default_settings["dcc_paths_mac"]
+                        else:
+                            settings["dcc_paths_mac"] = settings.pop("dcc_paths")
+                            settings["dcc_paths_win"] = default_settings["dcc_paths_win"]
+                    
+                    # Ensure all keys exist
+                    for k, v in default_settings.items():
+                        if k not in settings:
+                            settings[k] = v
+                            
                     return settings
             except: pass
-        return {"last_user": "", "last_pass": "", "remember": False, "project_root": "", "dcc_paths": {"Maya": "", "Blender": "", "Houdini": ""}}
+        return default_settings
+
+    @property
+    def dcc_paths(self):
+        import platform
+        if platform.system() == "Windows":
+            return self.settings.get("dcc_paths_win", {})
+        else:
+            return self.settings.get("dcc_paths_mac", {})
+
+    @dcc_paths.setter
+    def dcc_paths(self, value):
+        import platform
+        if platform.system() == "Windows":
+            self.settings["dcc_paths_win"] = value
+        else:
+            self.settings["dcc_paths_mac"] = value
 
     def save_settings(self, username, password, remember):
         try:

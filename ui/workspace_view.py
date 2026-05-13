@@ -148,7 +148,7 @@ class WorkspaceView(QWidget):
             self.show_dcc_selector(task_obj)
             return
 
-        dcc_exe = self.auth.settings.get("dcc_paths", {}).get(dcc_name)
+        dcc_exe = self.auth.dcc_paths.get(dcc_name)
         reg_path = os.path.join(self.project_path, "registry.json")
         
         if not dcc_exe or not os.path.exists(dcc_exe):
@@ -181,7 +181,7 @@ class WorkspaceView(QWidget):
         self.launch_task("Blender", task_obj, None)
 
     def launch_task(self, dcc_name, task_obj, dialog=None):
-        dcc_exe = self.auth.settings.get("dcc_paths", {}).get(dcc_name)
+        dcc_exe = self.auth.dcc_paths.get(dcc_name)
         reg_path = os.path.join(self.project_path, "registry.json")
         if not dcc_exe:
             target = dialog if dialog else self

@@ -11,6 +11,109 @@ from ui.project_hub import ProjectHubView
 from ui.workspace_view import WorkspaceView
 from ui.settings_dialog import ProjectRootDialog, DCCPathsDialog
 
+def get_system_root():
+    home_dir = os.path.expanduser("~")
+    system_root = os.path.join(home_dir, "Documents", "cgpipeline_system")
+    if not os.path.exists(system_root):
+        os.makedirs(system_root)
+    return system_root
+
+def bring_to_front(pid):
+    """Attempts to bring the existing process window to the front."""
+    system = platform.system()
+    if system == "Darwin":
+        try:
+            script = f'tell application "System Events" to set frontmost of every process whose unix id is {pid} to true'
+            subprocess.run(["osascript", "-e", script])
+        except Exception as e:
+            print(f"Failed to focus existing window on macOS: {e}")
+    elif system == "Windows":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            # Define constants
+            SW_RESTORE = 9
+            
+            def enum_window_callback(hwnd, lparam):
+                window_pid = wintypes.DWORD()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+                if window_pid.value == lparam:
+                    # If we find ANY window belonging to this PID that is visible
+                    if ctypes.windll.user32.IsWindowVisible(hwnd):
+                        # Attempt to restore and bring to top
+                        ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                        # We don't return False here because a process might have multiple windows (e.g. splash)
+                        # but we want to find the "best" one. Usually the first visible one is good.
+                        return False 
+                return True
+
+            callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+            callback = callback_type(enum_window_callback)
+            ctypes.windll.user32.EnumWindows(callback, pid)
+        except Exception as e:
+            print(f"Failed to focus existing window on Windows: {e}")
+
+def ensure_single_instance(system_root):
+    """
+    Ensures only one instance of the app is running.
+    Uses a Named Mutex on Windows and a Lock File on macOS.
+    """
+    lock_file = os.path.join(system_root, "app.lock")
+    
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            # Unique name for the mutex
+            mutex_name = "Global\\CGPipeline_SingleInstance_Mutex"
+            # CreateMutexW will return a handle even if it already exists
+            kernel32 = ctypes.windll.kernel32
+            # Handle to the mutex (we must keep this alive for the duration of the app)
+            # We store it on the module level to prevent garbage collection
+            global _app_mutex
+            _app_mutex = kernel32.CreateMutexW(None, False, mutex_name)
+            last_error = kernel32.GetLastError()
+            
+            # ERROR_ALREADY_EXISTS = 183
+            if last_error == 183:
+                # Already running! Try to find the PID from the lock file to bring it to front
+                if os.path.exists(lock_file):
+                    with open(lock_file, "r") as f:
+                        try:
+                            pid = int(f.read().strip())
+                            bring_to_front(pid)
+                        except: pass
+                return False # Signal to exit
+            
+            # We are the first instance. Write our PID for others to find.
+            with open(lock_file, "w") as f:
+                f.write(str(os.getpid()))
+            return True
+            
+        except Exception as e:
+            print(f"Windows single instance check error: {e}")
+            return True # Fallback to allowing launch
+            
+    else:
+        # macOS / Linux logic (Standard Lock File)
+        if os.path.exists(lock_file):
+            try:
+                with open(lock_file, "r") as f:
+                    pid = int(f.read().strip())
+                if pid != os.getpid():
+                    try:
+                        os.kill(pid, 0)
+                        bring_to_front(pid)
+                        return False
+                    except (OSError, ProcessLookupError):
+                        pass
+            except: pass
+            
+        with open(lock_file, "w") as f:
+            f.write(str(os.getpid()))
+        return True
+
 class CGPipelineApp(QMainWindow):
     def __init__(self, system_root):
         super().__init__()
@@ -37,60 +140,6 @@ class CGPipelineApp(QMainWindow):
                 self.show_login()
         else:
             self.show_login()
-
-    def check_single_instance(self):
-        if os.path.exists(self.lock_file):
-            try:
-                with open(self.lock_file, "r") as f:
-                    pid = int(f.read().strip())
-                if os.name == 'nt':
-                    # Windows PID check
-                    import ctypes
-                    process_exists = ctypes.windll.kernel32.OpenProcess(1, False, pid) > 0
-                else:
-                    # Unix PID check
-                    try:
-                        os.kill(pid, 0)
-                        process_exists = True
-                    except OSError:
-                        process_exists = False
-                
-                if process_exists:
-                    self.bring_to_front(pid)
-                    return False
-            except: pass
-            
-        with open(self.lock_file, "w") as f:
-            f.write(str(os.getpid()))
-        return True
-
-    def bring_to_front(self, pid):
-        """Attempts to bring the existing process window to the front."""
-        system = platform.system()
-        if system == "Darwin":
-            try:
-                # Use AppleScript to focus the process by PID
-                script = f'tell application "System Events" to set frontmost of every process whose unix id is {pid} to true'
-                subprocess.run(["osascript", "-e", script])
-            except Exception as e:
-                print(f"Failed to focus existing window on macOS: {e}")
-        elif system == "Windows":
-            try:
-                import ctypes
-                def enum_window_callback(hwnd, lparam):
-                    window_pid = ctypes.c_int()
-                    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
-                    if window_pid.value == lparam:
-                        ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
-                        ctypes.windll.user32.SetForegroundWindow(hwnd)
-                        return False
-                    return True
-
-                callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
-                callback = callback_type(enum_window_callback)
-                ctypes.windll.user32.EnumWindows(callback, pid)
-            except Exception as e:
-                print(f"Failed to focus existing window on Windows: {e}")
 
     def closeEvent(self, event):
         if hasattr(self, 'lock_file') and os.path.exists(self.lock_file):
@@ -153,19 +202,17 @@ class CGPipelineApp(QMainWindow):
         self.stack.setCurrentWidget(self.workspace_view)
 
 if __name__ == "__main__":
-    # Cross-platform: Use home directory for system data
-    home_dir = os.path.expanduser("~")
-    system_root = os.path.join(home_dir, "Documents", "cgpipeline_system")
-    
-    if not os.path.exists(system_root):
-        os.makedirs(system_root)
+    system_root = get_system_root()
+
+    # CRITICAL: Check single instance BEFORE creating QApplication or any Window
+    # This prevents "ghost" windows from appearing when launching a second instance.
+    if not ensure_single_instance(system_root):
+        sys.exit(0)
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
     window = CGPipelineApp(system_root)
-    if not window.check_single_instance():
-        sys.exit(0)
     
     # Save current app path for DCCs to find
     window.auth.settings["app_main_path"] = os.path.abspath(__file__)
