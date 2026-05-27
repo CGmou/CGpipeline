@@ -134,7 +134,65 @@ def launch_dcc(dcc_name, exe_path, task_obj, registry_path):
             subprocess.Popen(cmd, env=env, shell=use_shell)
             return True, None
 
-        # 2. Handle Generic/Other DCCs
+        # 2. Handle Maya
+        if dcc_name == "Maya":
+            # Push our dcc/maya folder onto MAYA_SCRIPT_PATH so Maya picks up userSetup.py.
+            maya_scripts = os.path.dirname(os.path.abspath(__file__))
+            maya_scripts = os.path.join(maya_scripts, "dcc", "maya")
+            path_sep = ";" if platform.system() == "Windows" else ":"
+            env["MAYA_SCRIPT_PATH"] = maya_scripts + path_sep + env.get("MAYA_SCRIPT_PATH", "")
+            env["PYTHONPATH"] = maya_scripts + path_sep + env.get("PYTHONPATH", "")
+
+            if latest_file:
+                target_file = os.path.join(task_folder, latest_file)
+            else:
+                v001_name = build_work_filename(
+                    task_obj.get("name", "entity"),
+                    task_obj.get("sub_category", ""),
+                    task_obj.get("type", ""),
+                    1,
+                    ".ma"
+                )
+                target_file = os.path.normpath(os.path.join(task_folder, v001_name))
+                os.makedirs(task_folder, exist_ok=True)
+                # Don't pre-create an empty .ma — Maya can't open a zero-byte file.
+                # The bootstrap script saves a new empty scene to this path instead.
+                env["CGP_NEW_FILE_TARGET"] = target_file
+
+            # SAME-SESSION: if we were launched from a Maya session, write the command file
+            # for the running Maya to pick up instead of launching a new instance.
+            is_from_dcc = os.environ.get("CGP_IN_DCC") == "Maya"
+            if is_from_dcc:
+                import json
+                command_file = os.environ.get("CGP_COMMAND_FILE")
+                if not command_file:
+                    command_file = os.path.join(
+                        os.path.expanduser("~"), "Documents", "cgpipeline_system", "maya_command.json"
+                    )
+                cmd_data = {
+                    "action": "open_task",
+                    "filepath": target_file,
+                    "task_id": str(task_obj.get("id", "")),
+                    "entity_name": str(task_obj.get("name", "")),
+                    "task_type": str(task_obj.get("type", "")),
+                    "registry_path": str(registry_path),
+                }
+                try:
+                    os.makedirs(os.path.dirname(command_file), exist_ok=True)
+                    with open(command_file, "w") as f:
+                        json.dump(cmd_data, f)
+                    return True, None
+                except Exception as e:
+                    print(f"CGPipeline Error: Failed to write Maya command file: {e}")
+
+            # LAUNCH NEW MAYA
+            cmd = [exe_path]
+            if latest_file:
+                cmd.append(target_file)
+            subprocess.Popen(cmd, env=env, shell=use_shell)
+            return True, None
+
+        # 3. Handle Generic/Other DCCs
         else:
             if latest_file:
                 full_latest_path = os.path.join(task_folder, latest_file)
@@ -143,7 +201,7 @@ def launch_dcc(dcc_name, exe_path, task_obj, registry_path):
                 else:
                      open_file_cross_platform(full_latest_path)
             else:
-                ext = ".ma" if dcc_name == "Maya" else ".hipnc" if dcc_name == "Houdini" else ".txt"
+                ext = ".hipnc" if dcc_name == "Houdini" else ".txt"
                 v001_name = build_work_filename(
                     task_obj.get("name", "entity"),
                     task_obj.get("sub_category", ""),
@@ -153,14 +211,14 @@ def launch_dcc(dcc_name, exe_path, task_obj, registry_path):
                 )
                 v001_full_path = os.path.normpath(os.path.join(task_folder, v001_name))
                 os.makedirs(task_folder, exist_ok=True)
-                
+
                 with open(v001_full_path, "w") as f: pass
-                
+
                 if exe_path:
                     subprocess.Popen([exe_path, v001_full_path], env=env, shell=use_shell)
                 else:
                     open_file_cross_platform(v001_full_path)
-                    
+
             return True, None
 
     except Exception as e:

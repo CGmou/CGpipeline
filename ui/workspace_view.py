@@ -19,7 +19,9 @@ class WorkspaceView(QWidget):
         self.project_path = project_path
         self.auth = auth_manager
         self.registry = TaskRegistry(project_path)
-        self.registry.data["current_user"] = self.auth.current_user["username"]
+        # Per-session only — never persisted, so concurrent users on the same
+        # project don't overwrite each other's "MY TASKS" filter.
+        self.registry.current_user = self.auth.current_user["username"]
         self.show_thumbs = True
         self.setup_ui()
 
@@ -177,8 +179,38 @@ class WorkspaceView(QWidget):
             self.show_dcc_selector(task_obj)
 
     def show_dcc_selector(self, task_obj):
-        # Auto-select Blender as Maya and Houdini are hidden for now
-        self.launch_task("Blender", task_obj, None)
+        """Ask the user which DCC to use for a brand-new task (no existing version)."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select DCC")
+        dialog.setMinimumWidth(320)
+        dialog.setStyleSheet("""
+            QDialog { background-color: #1E1E1E; }
+            QLabel { color: #BBB; }
+            QPushButton {
+                background-color: #2D2D2D; color: white; border: 1px solid #3D3D3D;
+                padding: 14px 20px; border-radius: 6px; font-weight: bold;
+            }
+            QPushButton:hover { background-color: #0078D4; border-color: #0078D4; }
+        """)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            f"Choose a DCC for new task:\n"
+            f"  {task_obj.get('name', '')}  —  {task_obj.get('type', '')}"
+        ))
+
+        row = QHBoxLayout()
+        configured = self.auth.dcc_paths or {}
+        for dcc in ("Blender", "Maya"):
+            btn = QPushButton(dcc)
+            if not configured.get(dcc):
+                btn.setEnabled(False)
+                btn.setToolTip(f"{dcc} path not set — Settings → DCC Paths")
+            btn.clicked.connect(lambda checked=False, d=dcc: self.launch_task(d, task_obj, dialog))
+            row.addWidget(btn)
+        layout.addLayout(row)
+        dialog.exec()
 
     def launch_task(self, dcc_name, task_obj, dialog=None):
         dcc_exe = self.auth.dcc_paths.get(dcc_name)

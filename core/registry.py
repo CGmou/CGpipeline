@@ -4,6 +4,7 @@ import uuid
 import shutil
 from datetime import datetime
 from .folder_template import create_asset_structure, create_shot_structure, create_project_base
+from .utils import is_safe_subpath
 
 class TaskRegistry:
     def __init__(self, root_path):
@@ -11,10 +12,11 @@ class TaskRegistry:
         self.registry_file = os.path.join(self.root_path, "registry.json")
         self.data = {
             "project_name": "New Project",
-            "current_user": "Artist",
             "color_management": "ACES 1.3",
             "tasks": []
         }
+        # Per-session, not persisted to JSON. Set by the workspace view after login.
+        self.current_user = "Unknown Artist"
         self.load()
 
     def load(self):
@@ -23,7 +25,13 @@ class TaskRegistry:
                 with open(self.registry_file, "r") as f:
                     self.data.update(json.load(f))
                 needs_save = False
-                
+
+                # Legacy cleanup: older registries persisted current_user, which leaked
+                # across logins. Strip it from data so it never gets re-saved.
+                if "current_user" in self.data:
+                    self.data.pop("current_user", None)
+                    needs_save = True
+
                 # Ensure color_management exists
                 if "color_management" not in self.data:
                     self.data["color_management"] = "ACES 1.3"; needs_save = True
@@ -60,8 +68,6 @@ class TaskRegistry:
     def tasks(self): return self.data.get("tasks", [])
     @property
     def project_name(self): return self.data.get("project_name", "Unknown Project")
-    @property
-    def current_user(self): return self.data.get("current_user", "Unknown Artist")
 
     def save(self):
         if not os.path.exists(self.root_path): os.makedirs(self.root_path)
@@ -142,13 +148,17 @@ class TaskRegistry:
                 else:
                     # task_path is .../Shot/Lighting -> entity_root is .../Shot
                     entity_root = os.path.dirname(task_path)
-                
-                if os.path.exists(entity_root):
+
+                if not is_safe_subpath(entity_root, self.root_path):
+                    print(f"CGPipeline Error: Refusing to delete entity folder outside project root: {entity_root}")
+                elif os.path.exists(entity_root):
                     shutil.rmtree(entity_root)
                     print(f"CGPipeline: Deleted entity folder: {entity_root}")
             else:
                 # Just delete the specific task wip folder
-                if os.path.exists(task_path):
+                if not is_safe_subpath(task_path, self.root_path):
+                    print(f"CGPipeline Error: Refusing to delete task folder outside project root: {task_path}")
+                elif os.path.exists(task_path):
                     shutil.rmtree(task_path)
                     print(f"CGPipeline: Deleted task folder: {task_path}")
         except Exception as e:
