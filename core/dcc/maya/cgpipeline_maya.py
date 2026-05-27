@@ -140,6 +140,30 @@ def _apply_color_management():
         print(f"CGPipeline: Could not read color_management from registry: {e}")
 
 
+def _set_project_workspace():
+    """Point Maya's workspace at the CGPipeline project root so file textures,
+    references, and caches resolve against it. The project root is the folder
+    containing registry.json. Without this, Maya keeps its previous project and
+    relative-path lookups go to the wrong place."""
+    if not STATE.reg_path:
+        return
+    proj_root = os.path.dirname(STATE.reg_path)
+    if not os.path.isdir(proj_root):
+        return
+    try:
+        # openWorkspace falls back to defaults when workspace.mel is absent,
+        # which is the common case for a freshly created CGPipeline project.
+        cmds.workspace(proj_root, openWorkspace=True)
+        print(f"CGPipeline: Maya project → {proj_root}")
+    except Exception as e:
+        # Fallback: just set the current workspace dir without opening.
+        try:
+            cmds.workspace(dir=proj_root)
+            print(f"CGPipeline: Maya project dir set to {proj_root}")
+        except Exception as e2:
+            print(f"CGPipeline: Could not set Maya project: {e2}")
+
+
 def _save_new_scene_if_requested():
     """Launcher passes CGP_NEW_FILE_TARGET when there's no existing version.
     Save the empty scene there so subsequent saves version up correctly."""
@@ -186,6 +210,10 @@ def _check_command_file():
     os.environ["CGP_TASK_PATH"] = os.path.dirname(fp)
     os.environ["CGP_TASK_TYPE"] = cmd.get("task_type", "")
     os.environ["CGP_REGISTRY_PATH"] = cmd.get("registry_path", "")
+    # Refresh state and Maya project BEFORE opening the file so relative-path
+    # lookups (textures, refs, caches) resolve against the right project.
+    _read_env_into_state()
+    _set_project_workspace()
     try:
         if os.path.exists(fp):
             cmds.file(fp, open=True, force=True)
@@ -194,7 +222,6 @@ def _check_command_file():
             os.environ["CGP_NEW_FILE_TARGET"] = fp
             cmds.file(new=True, force=True)
             _save_new_scene_if_requested()
-        _read_env_into_state()
         _apply_color_management()
         _refresh_panel_state()
         print(f"CGPipeline: Opened task {cmd.get('task_id')}")
@@ -528,6 +555,142 @@ def op_publish():
 
 
 # --------------------------------------------------------------------------------------
+# Operations: Import Model (asset-context setup for lookdev / rig / texture tasks)
+# --------------------------------------------------------------------------------------
+def _find_asset_publish_dir():
+    """Return the current asset's Publish folder, or None if not in asset context.
+    Expects task_path like Assets/<Category>/<AssetName>/<Dept>/_wip."""
+    if STATE.category != "Assets" or not STATE.task_path:
+        return None
+    norm = os.path.normpath(STATE.task_path).replace("\\", "/")
+    parts = norm.split("/")
+    if "Assets" not in parts:
+        return None
+    idx = parts.index("Assets")
+    if len(parts) < idx + 3:
+        return None
+    asset_root = os.path.normpath("/".join(parts[:idx + 3]))
+    pub = os.path.join(asset_root, "Publish")
+    return pub if os.path.isdir(pub) else None
+
+
+def _list_model_publishes(pub_dir):
+    """Model publishes have '_mdl' in the name and a DCC/cache extension we can ingest.
+    Latest mtime first."""
+    if not pub_dir or not os.path.isdir(pub_dir):
+        return []
+    out = []
+    for f in os.listdir(pub_dir):
+        fl = f.lower()
+        if "_mdl" not in fl:
+            continue
+        if not fl.endswith((".ma", ".mb", ".abc", ".usd", ".usda", ".usdc")):
+            continue
+        full = os.path.join(pub_dir, f)
+        out.append((full, os.path.getmtime(full)))
+    out.sort(key=lambda x: x[1], reverse=True)
+    return [p for p, _ in out]
+
+
+def _pick_file_dialog(files, title):
+    """Modal picker — returns the chosen absolute path, or None on cancel."""
+    parent = _maya_main_window()
+    dlg = QtWidgets.QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.resize(420, 320)
+    layout = QtWidgets.QVBoxLayout(dlg)
+    layout.addWidget(QtWidgets.QLabel(f"{len(files)} files. Latest first:"))
+    lst = QtWidgets.QListWidget()
+    for f in files:
+        item = QtWidgets.QListWidgetItem(os.path.basename(f))
+        item.setData(QtCore.Qt.UserRole, f)
+        lst.addItem(item)
+    lst.setCurrentRow(0)
+    lst.itemDoubleClicked.connect(lambda _: dlg.accept())
+    layout.addWidget(lst)
+    btn_row = QtWidgets.QHBoxLayout()
+    cancel_btn = QtWidgets.QPushButton("Cancel")
+    ok_btn = QtWidgets.QPushButton("OK")
+    ok_btn.setDefault(True)
+    cancel_btn.clicked.connect(dlg.reject)
+    ok_btn.clicked.connect(dlg.accept)
+    btn_row.addStretch()
+    btn_row.addWidget(cancel_btn)
+    btn_row.addWidget(ok_btn)
+    layout.addLayout(btn_row)
+    if dlg.exec() != QtWidgets.QDialog.Accepted:
+        return None
+    item = lst.currentItem()
+    return item.data(QtCore.Qt.UserRole) if item else None
+
+
+def op_import_model(mode="reference"):
+    """Bring the current asset's model publish into the scene.
+    mode='reference' — Maya reference (good for lookdev — updates propagate).
+    mode='import' — merge into scene as native nodes (good for rig — editable topology).
+    """
+    pub = _find_asset_publish_dir()
+    if not pub:
+        cmds.warning(
+            "CGPipeline: Not in an asset context, or asset has no Publish folder yet."
+        )
+        return
+    files = _list_model_publishes(pub)
+    if not files:
+        cmds.warning(f"CGPipeline: No model publishes found in {pub}")
+        return
+
+    chosen = files[0] if len(files) == 1 else _pick_file_dialog(
+        files, f"Pick model to {mode.title()}"
+    )
+    if not chosen:
+        return
+
+    ns = STATE.entity or "model"
+    ext = os.path.splitext(chosen)[1].lower()
+    label = mode.title()
+
+    try:
+        if mode == "reference":
+            if ext in (".ma", ".mb"):
+                cmds.file(
+                    chosen, reference=True, namespace=ns,
+                    mergeNamespacesOnClash=False, ignoreVersion=True,
+                )
+            elif ext == ".abc":
+                # Alembic-as-reference isn't a real Maya reference; AbcImport
+                # creates a cacheFile-driven mesh, which behaves reference-like
+                # (updates if the cache changes) and is fine for lookdev.
+                cmds.AbcImport(chosen, mode="import")
+                cmds.warning(
+                    "CGPipeline: ABC referenced via cacheFile (no Maya reference node)."
+                )
+            elif ext in (".usd", ".usda", ".usdc"):
+                try:
+                    cmds.file(
+                        chosen, reference=True, namespace=ns,
+                        type="USD Import", ignoreVersion=True,
+                    )
+                except Exception:
+                    cmds.mayaUSDImport(file=chosen)
+                    cmds.warning(
+                        "CGPipeline: USD reference unsupported here; imported instead."
+                    )
+        else:  # import
+            if ext in (".ma", ".mb"):
+                # No namespace on import — rig/lookdev artists usually want
+                # native names in the outliner.
+                cmds.file(chosen, i=True, ignoreVersion=True)
+            elif ext == ".abc":
+                cmds.AbcImport(chosen, mode="import")
+            elif ext in (".usd", ".usda", ".usdc"):
+                cmds.mayaUSDImport(file=chosen)
+        print(f"CGPipeline: {label} model → {chosen}")
+    except Exception as e:
+        cmds.warning(f"CGPipeline: {label} failed: {e}")
+
+
+# --------------------------------------------------------------------------------------
 # Operations: Assembly
 # --------------------------------------------------------------------------------------
 def _shot_root_from_task_path():
@@ -744,6 +907,18 @@ class CGPipelinePanel(QtWidgets.QWidget):
         srow.addWidget(self.status_combo, 1)
         srow.addWidget(self._btn("Update", lambda: op_update_status(self.status_combo.currentText())))
         v.addLayout(srow)
+        v.addWidget(self._sep())
+
+        # Import Model — for lookdev / rig / texture tasks that need upstream geometry
+        v.addWidget(self._section("Import Model"))
+        v.addWidget(QtWidgets.QLabel(
+            "From the current asset's Publish folder.\n"
+            "Reference: lookdev (updates propagate).  Import: rig (native, editable)."
+        ))
+        mrow = QtWidgets.QHBoxLayout()
+        mrow.addWidget(self._btn("REFERENCE", lambda: op_import_model(mode="reference")))
+        mrow.addWidget(self._btn("IMPORT", lambda: op_import_model(mode="import")))
+        v.addLayout(mrow)
         v.addWidget(self._sep())
 
         # Publisher
@@ -990,6 +1165,7 @@ def _ensure_shelf():
 # --------------------------------------------------------------------------------------
 def initialize():
     _read_env_into_state()
+    _set_project_workspace()
     _load_plugins()
     _save_new_scene_if_requested()
     _apply_color_management()
