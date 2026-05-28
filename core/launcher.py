@@ -16,6 +16,64 @@ def open_file_cross_platform(filepath):
     else:  # Linux
         subprocess.Popen(["xdg-open", filepath])
 
+
+def _pid_alive(pid):
+    """Cross-platform check whether a process id is currently running."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return bool(ok) and code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+
+def get_live_maya_session():
+    """Return the heartbeat dict for a running CGPipeline-enabled Maya, or None.
+    The Maya plugin rewrites maya_session.json every ~1s with its pid + timestamp,
+    so the dashboard can route a task into the existing Maya instead of launching
+    a new one. The staleness window also guards against PID recycling from an old
+    session whose heartbeat file was left behind by a crash."""
+    session_file = os.path.join(
+        os.path.expanduser("~"), "Documents", "cgpipeline_system", "maya_session.json"
+    )
+    if not os.path.exists(session_file):
+        return None
+    try:
+        import json
+        import time
+        with open(session_file, "r") as f:
+            data = json.load(f)
+        pid = data.get("pid")
+        ts = data.get("ts", 0)
+        if not pid or (time.time() - ts) > 60:
+            return None
+        return data if _pid_alive(pid) else None
+    except Exception:
+        return None
+
 def resolve_executable_path(dcc_name, path):
     """
     On macOS, if the path is a .app bundle, resolve to the internal executable.
@@ -57,6 +115,11 @@ def launch_dcc(dcc_name, exe_path, task_obj, registry_path):
 
     # Prepare Environment
     env = os.environ.copy()
+    # Never inherit a stale new-file target. If the dashboard was launched from a Maya
+    # that was opened for a *new* task, CGP_NEW_FILE_TARGET would otherwise ride along
+    # and make the bootstrap overwrite the file we're opening for "Continue Work".
+    # Only the new-task branch below sets it fresh.
+    env.pop("CGP_NEW_FILE_TARGET", None)
     env["CGP_TASK_ID"] = str(task_obj.get("id", "")).strip()
     env["CGP_TASK_PATH"] = str(task_obj.get("path", "")).strip()
     env["CGP_ENTITY_NAME"] = str(task_obj.get("name", "")).strip()
@@ -159,12 +222,22 @@ def launch_dcc(dcc_name, exe_path, task_obj, registry_path):
                 # The bootstrap script saves a new empty scene to this path instead.
                 env["CGP_NEW_FILE_TARGET"] = target_file
 
-            # SAME-SESSION: if we were launched from a Maya session, write the command file
-            # for the running Maya to pick up instead of launching a new instance.
+            # SAME-SESSION: if a CGPipeline-enabled Maya is already running, route the
+            # task into it via the command file instead of launching a new instance.
+            #
+            # Check the live heartbeat ALWAYS — not just in the standalone case. The
+            # running Maya advertises exactly where it's listening (command_file), so we
+            # trust that over any env var, which avoids stale/mismatched CGP_COMMAND_FILE
+            # plumbing when the dashboard was launched from inside Maya.
             is_from_dcc = os.environ.get("CGP_IN_DCC") == "Maya"
-            if is_from_dcc:
+            session = get_live_maya_session()
+            if session or is_from_dcc:
                 import json
-                command_file = os.environ.get("CGP_COMMAND_FILE")
+                command_file = None
+                if session:
+                    command_file = session.get("command_file")  # authoritative: where the live Maya polls
+                if not command_file:
+                    command_file = os.environ.get("CGP_COMMAND_FILE")
                 if not command_file:
                     command_file = os.path.join(
                         os.path.expanduser("~"), "Documents", "cgpipeline_system", "maya_command.json"

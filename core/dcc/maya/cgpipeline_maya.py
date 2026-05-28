@@ -12,6 +12,8 @@ Mirrors core/dcc/blender/cgpipeline_blender.py:
 import os
 import re
 import json
+import time
+import atexit
 import shutil
 import subprocess
 
@@ -24,6 +26,7 @@ from shiboken6 import wrapInstance
 
 SYSTEM_ROOT = os.path.join(os.path.expanduser("~"), "Documents", "cgpipeline_system")
 COMMAND_FILE = os.path.join(SYSTEM_ROOT, "maya_command.json")
+SESSION_FILE = os.path.join(SYSTEM_ROOT, "maya_session.json")
 SHELF_NAME = "CGPipeline"
 
 TASK_ABBR = {
@@ -170,6 +173,14 @@ def _save_new_scene_if_requested():
     target = os.environ.get("CGP_NEW_FILE_TARGET", "").strip()
     if not target:
         return
+    # Safety: never clobber a scene that's already open. On "Continue Work" the file
+    # is opened from the command line before this deferred bootstrap runs, so the
+    # scene already has a name — bail out and leave it untouched.
+    try:
+        if cmds.file(q=True, sceneName=True):
+            return
+    except Exception:
+        pass
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         cmds.file(new=True, force=True)
@@ -181,9 +192,33 @@ def _save_new_scene_if_requested():
 
 
 # --------------------------------------------------------------------------------------
-# Same-session command listener
+# Same-session command listener + heartbeat
 # --------------------------------------------------------------------------------------
+def _touch_session():
+    """Heartbeat so a standalone dashboard can detect this live Maya and route
+    tasks here instead of launching a new instance. Rewritten every timer tick."""
+    try:
+        os.makedirs(SYSTEM_ROOT, exist_ok=True)
+        with open(SESSION_FILE, "w") as f:
+            json.dump(
+                {"pid": os.getpid(), "ts": time.time(), "command_file": COMMAND_FILE}, f
+            )
+    except Exception:
+        pass
+
+
+def _remove_session():
+    """Drop the heartbeat on clean shutdown so the launcher won't try to reuse us."""
+    try:
+        if os.path.exists(SESSION_FILE):
+            os.remove(SESSION_FILE)
+    except Exception:
+        pass
+
+
 def _check_command_file():
+    # Heartbeat first, every tick, regardless of whether a command is pending.
+    _touch_session()
     if not os.path.exists(COMMAND_FILE):
         return
     try:
@@ -867,40 +902,41 @@ class CGPipelinePanel(QtWidgets.QWidget):
         s.setFrameShadow(QtWidgets.QFrame.Sunken)
         return s
 
-    def _build(self):
-        scroll = QtWidgets.QScrollArea(self)
+    def _wrap_scroll(self, widget):
+        """Put a tab's content widget inside a scroll area so tall tabs stay usable."""
+        scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
-        inner = QtWidgets.QWidget()
-        scroll.setWidget(inner)
-        v = QtWidgets.QVBoxLayout(inner)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
+
+    def _build(self):
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+
+        # Always-visible header: dashboard entry point + current task.
+        outer.addWidget(self._btn("Open Dashboard", op_open_dashboard))
+        self.task_label = QtWidgets.QLabel("TASK: -")
+        self.task_label.setStyleSheet("color: #cccccc; font-weight: bold;")
+        outer.addWidget(self.task_label)
+
+        tabs = QtWidgets.QTabWidget()
+        outer.addWidget(tabs, 1)
+        tabs.addTab(self._make_task_tab(), "Task")
+        tabs.addTab(self._make_model_tab(), "Model")
+        tabs.addTab(self._make_publish_tab(), "Publish")
+        tabs.addTab(self._make_assembly_tab(), "Assembly")
+
+    # ---- tabs ----
+    def _make_task_tab(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
-        outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
-
-        # Dashboard
-        v.addWidget(self._btn("Open Dashboard", op_open_dashboard))
-        v.addWidget(self._sep())
-
-        # Quick Tools
-        v.addWidget(self._section("Quick Tools"))
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self._btn("Save", op_save))
-        row.addWidget(self._btn("Version Up", op_save_version))
-        v.addLayout(row)
-        v.addWidget(self._btn("Fix Missing Textures", op_fix_texture_paths))
-        row2 = QtWidgets.QHBoxLayout()
-        row2.addWidget(self._btn("2K", lambda: op_switch_texture_res("2k")))
-        row2.addWidget(self._btn("4K", lambda: op_switch_texture_res("4k")))
-        v.addLayout(row2)
-        v.addWidget(self._sep())
-
         # Status
         v.addWidget(self._section("Status"))
-        self.task_label = QtWidgets.QLabel("TASK: -")
-        v.addWidget(self.task_label)
         srow = QtWidgets.QHBoxLayout()
         self.status_combo = QtWidgets.QComboBox()
         self.status_combo.addItems(["NO CHANGE", "Pending Review", "Approved", "In Progress"])
@@ -909,20 +945,49 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.addLayout(srow)
         v.addWidget(self._sep())
 
-        # Import Model — for lookdev / rig / texture tasks that need upstream geometry
+        # File
+        v.addWidget(self._section("File"))
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self._btn("Save", op_save))
+        row.addWidget(self._btn("Version Up", op_save_version))
+        v.addLayout(row)
+        v.addWidget(self._sep())
+
+        # Textures
+        v.addWidget(self._section("Textures"))
+        v.addWidget(self._btn("Fix Missing Textures", op_fix_texture_paths))
+        trow = QtWidgets.QHBoxLayout()
+        trow.addWidget(self._btn("2K", lambda: op_switch_texture_res("2k")))
+        trow.addWidget(self._btn("4K", lambda: op_switch_texture_res("4k")))
+        v.addLayout(trow)
+
+        v.addStretch()
+        return self._wrap_scroll(w)
+
+    def _make_model_tab(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
         v.addWidget(self._section("Import Model"))
         v.addWidget(QtWidgets.QLabel(
             "From the current asset's Publish folder.\n"
-            "Reference: lookdev (updates propagate).  Import: rig (native, editable)."
+            "Reference: lookdev (updates propagate).\n"
+            "Import: rig (native, editable)."
         ))
         mrow = QtWidgets.QHBoxLayout()
         mrow.addWidget(self._btn("REFERENCE", lambda: op_import_model(mode="reference")))
         mrow.addWidget(self._btn("IMPORT", lambda: op_import_model(mode="import")))
         v.addLayout(mrow)
-        v.addWidget(self._sep())
+        v.addStretch()
+        return self._wrap_scroll(w)
 
-        # Publisher
-        v.addWidget(self._section("Publisher"))
+    def _make_publish_tab(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
         self.publish_label = QtWidgets.QLabel("PUBLISHING: -")
         v.addWidget(self.publish_label)
         prow = QtWidgets.QHBoxLayout()
@@ -966,7 +1031,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.addWidget(QtWidgets.QLabel("Selection List:"))
         self.publish_list_w = QtWidgets.QListWidget()
         self.publish_list_w.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        v.addWidget(self.publish_list_w)
+        v.addWidget(self.publish_list_w, 1)
         lrow = QtWidgets.QHBoxLayout()
         lrow.addWidget(self._btn("Add", self._on_publish_add))
         lrow.addWidget(self._btn("Remove", self._on_publish_remove))
@@ -974,14 +1039,18 @@ class CGPipelinePanel(QtWidgets.QWidget):
         publish_btn = self._btn("PUBLISH", op_publish)
         publish_btn.setStyleSheet("font-weight: bold; padding: 6px;")
         v.addWidget(publish_btn)
-        v.addWidget(self._sep())
+        return self._wrap_scroll(w)
 
-        # Assembly
-        v.addWidget(self._section("Assembly"))
+    def _make_assembly_tab(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
         v.addWidget(self._btn("1. REFRESH", self._on_assembly_scan))
         v.addWidget(QtWidgets.QLabel("2. IMPORT LOOKDEV:"))
         self.lookdev_list_w = QtWidgets.QListWidget()
-        v.addWidget(self.lookdev_list_w)
+        v.addWidget(self.lookdev_list_w, 1)
         v.addWidget(self._btn("REFERENCE LOOKDEV", self._on_import_lookdev))
         v.addWidget(self._btn("3. MAKE EDITABLE (Maya ref is editable)", op_make_editable))
 
@@ -990,7 +1059,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         self.collection_tree.setColumnCount(3)
         self.collection_tree.setHeaderLabels(["Apply", "Group", "Cache"])
         self.collection_tree.itemClicked.connect(self._on_link_clicked)
-        v.addWidget(self.collection_tree)
+        v.addWidget(self.collection_tree, 1)
 
         self.cache_anim_chk = QtWidgets.QCheckBox("ANIM ONLY")
         self.cache_anim_chk.toggled.connect(self._on_anim_only_changed)
@@ -1000,6 +1069,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         arow.addWidget(self._btn("APPLY SELECTED", lambda: op_assembly_apply(batch=False)))
         arow.addWidget(self._btn("APPLY ALL", lambda: op_assembly_apply(batch=True)))
         v.addLayout(arow)
+        return self._wrap_scroll(w)
 
     # ---- state sync ----
     def _refresh_state_labels(self):
@@ -1170,6 +1240,8 @@ def initialize():
     _save_new_scene_if_requested()
     _apply_color_management()
     _start_command_watcher()
+    _touch_session()                      # advertise immediately, before the first timer tick
+    atexit.register(_remove_session)      # best-effort cleanup on Maya quit
     _ensure_shelf()
     if STATE.task_id and not cmds.about(batch=True):
         show_panel()
