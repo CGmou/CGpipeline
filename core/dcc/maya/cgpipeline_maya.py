@@ -244,6 +244,7 @@ def _check_command_file():
     os.environ["CGP_ENTITY_NAME"] = cmd.get("entity_name", "")
     os.environ["CGP_TASK_PATH"] = os.path.dirname(fp)
     os.environ["CGP_TASK_TYPE"] = cmd.get("task_type", "")
+    os.environ["CGP_CATEGORY"] = cmd.get("category", "")
     os.environ["CGP_REGISTRY_PATH"] = cmd.get("registry_path", "")
     # Refresh state and Maya project BEFORE opening the file so relative-path
     # lookups (textures, refs, caches) resolve against the right project.
@@ -604,9 +605,10 @@ def op_publish():
 # Operations: Import Model (asset-context setup for lookdev / rig / texture tasks)
 # --------------------------------------------------------------------------------------
 def _find_asset_publish_dir():
-    """Return the current asset's Publish folder, or None if not in asset context.
-    Expects task_path like Assets/<Category>/<AssetName>/<Dept>/_wip."""
-    if STATE.category != "Assets" or not STATE.task_path:
+    """Return the current asset's Publish folder, or None if not in an asset context.
+    Derived from the task path (Assets/<Category>/<AssetName>/...), so it works even
+    when CGP_CATEGORY wasn't propagated (e.g. a same-session task open)."""
+    if not STATE.task_path:
         return None
     norm = os.path.normpath(STATE.task_path).replace("\\", "/")
     parts = norm.split("/")
@@ -621,16 +623,18 @@ def _find_asset_publish_dir():
 
 
 def _list_model_publishes(pub_dir):
-    """Model publishes have '_mdl' in the name and a DCC/cache extension we can ingest.
-    Latest mtime first."""
+    """List importable model publishes in the asset's Publish folder (newest first).
+    Accepts common DCC/cache formats; excludes lookdev (_lkdev) and camera (_cam)
+    publishes so the list focuses on geometry we'd reference/import for lookdev/rig."""
     if not pub_dir or not os.path.isdir(pub_dir):
         return []
+    exts = (".ma", ".mb", ".abc", ".fbx", ".obj", ".usd", ".usda", ".usdc", ".usdz")
     out = []
     for f in os.listdir(pub_dir):
         fl = f.lower()
-        if "_mdl" not in fl:
+        if not fl.endswith(exts):
             continue
-        if not fl.endswith((".ma", ".mb", ".abc", ".usd", ".usda", ".usdc")):
+        if "_lkdev" in fl or "_lookdev" in fl or "_cam" in fl:
             continue
         full = os.path.join(pub_dir, f)
         out.append((full, os.path.getmtime(full)))
@@ -911,7 +915,9 @@ class CGPipelinePanel(QtWidgets.QWidget):
         dash_btn.setMinimumHeight(48)  # ~2 rows tall
         outer.addWidget(dash_btn)
         self.task_label = QtWidgets.QLabel("TASK: -")
-        self.task_label.setStyleSheet("color: #cccccc; font-weight: bold;")
+        self.task_label.setStyleSheet(
+            "color: #ffffff; font-weight: bold; font-size: 20px; padding: 4px 0;"
+        )
         outer.addWidget(self.task_label)
 
         tabs = QtWidgets.QTabWidget()
@@ -987,8 +993,6 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
-        self.publish_label = QtWidgets.QLabel("PUBLISHING: -")
-        v.addWidget(self.publish_label)
         prow = QtWidgets.QHBoxLayout()
         self.format_combo = QtWidgets.QComboBox()
         self.format_combo.addItems([".abc", ".usd", ".fbx", ".ma"])
@@ -1078,9 +1082,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         return f"{STATE.entity}_{abbr}" if abbr else STATE.entity
 
     def _refresh_state_labels(self):
-        name = self._entity_task_name()
-        self.task_label.setText(f"TASK: {name}")
-        self.publish_label.setText(f"PUBLISHING: {name}")
+        self.task_label.setText(f"TASK: {self._entity_task_name()}")
 
     # ---- handlers ----
     def _on_format_changed(self, t):
