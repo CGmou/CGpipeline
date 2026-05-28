@@ -678,10 +678,13 @@ def _do_import_model(chosen, mode):
     """Reference or import a specific model publish file.
     mode='reference' — Maya reference (good for lookdev — updates propagate).
     mode='import' — merge into scene as native nodes (good for rig — editable topology).
+
+    Reference uses "Merge into selected namespace and rename incoming objects that
+    match" — i.e. the root namespace with clash-renaming, so the model comes in
+    without a per-asset namespace prefix.
     """
     if not chosen:
         return
-    ns = STATE.entity or "model"
     ext = os.path.splitext(chosen)[1].lower()
     label = mode.title()
 
@@ -689,8 +692,9 @@ def _do_import_model(chosen, mode):
         if mode == "reference":
             if ext in (".ma", ".mb"):
                 cmds.file(
-                    chosen, reference=True, namespace=ns,
-                    mergeNamespacesOnClash=False, ignoreVersion=True,
+                    chosen, reference=True,
+                    namespace=":", mergeNamespacesOnClash=True,
+                    ignoreVersion=True,
                 )
             elif ext == ".abc":
                 # Alembic-as-reference isn't a real Maya reference; AbcImport
@@ -703,7 +707,8 @@ def _do_import_model(chosen, mode):
             elif ext in (".usd", ".usda", ".usdc"):
                 try:
                     cmds.file(
-                        chosen, reference=True, namespace=ns,
+                        chosen, reference=True,
+                        namespace=":", mergeNamespacesOnClash=True,
                         type="USD Import", ignoreVersion=True,
                     )
                 except Exception:
