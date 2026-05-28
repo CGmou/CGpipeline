@@ -51,16 +51,19 @@ class ProjectSheet(QWidget):
         self.tree.itemDoubleClicked.connect(self.on_item_double_clicked)
 
         toolbar = QHBoxLayout()
+        self.refresh_btn = QPushButton("REFRESH")
         self.expand_btn = QPushButton("EXPAND ALL")
         self.collapse_btn = QPushButton("COLLAPSE ALL")
-        for b in [self.expand_btn, self.collapse_btn]:
-            b.setStyleSheet("background-color: #333; color: #AAA; border: 1px solid #444; padding: 5px 15px; border-radius: 4px; font-size: 10px; font-weight: bold;")
+        for b in [self.refresh_btn, self.expand_btn, self.collapse_btn]:
+            b.setStyleSheet("QPushButton { background-color: #333; color: #AAA; border: 1px solid #444; padding: 5px 15px; border-radius: 4px; font-size: 10px; font-weight: bold; } QPushButton:hover { background-color: #444; color: white; }")
 
+        self.refresh_btn.clicked.connect(lambda: self.refresh(is_admin=self.is_admin))
         self.expand_btn.clicked.connect(self.tree.expandAll)
         self.collapse_btn.clicked.connect(self.tree.collapseAll)
 
         toolbar.addWidget(title)
         toolbar.addStretch()
+        toolbar.addWidget(self.refresh_btn)
         toolbar.addWidget(self.expand_btn)
         toolbar.addWidget(self.collapse_btn)
         layout.addLayout(toolbar)
@@ -93,6 +96,9 @@ class ProjectSheet(QWidget):
 
     def refresh(self, is_admin=False):
         self.is_admin = is_admin
+        # Reload from disk so the sheet reflects status/assignment changes made
+        # elsewhere (e.g. status updates pushed from Maya/Blender).
+        self.registry.load()
         expanded_paths = self.get_expanded_state()
         self.tree.clear()
 
