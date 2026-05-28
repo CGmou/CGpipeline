@@ -499,24 +499,26 @@ class CGP_OT_PublishAction(bpy.types.Operator):
     def execute(self, context):
         props = context.window_manager.cgp_props
         p, e, t, c = props.active_task_path, props.active_entity, props.active_task_type, props.active_category
-        if not p or not props.publish_list: return {'CANCELLED'}
         
+        if not p or not props.publish_list:
+            if not p: self.report({'WARNING'}, 'No active task path! Open a task from Dashboard first.')
+            if not props.publish_list: self.report({'WARNING'}, 'Publish list is empty! Add objects or collections.')
+            return {'CANCELLED'}
+        
+        if not e:
+            self.report({'WARNING'}, 'Active entity name is missing. Please re-open the task.')
+            return {'CANCELLED'}
+
         # Robust Publish Directory Discovery
-        # We look for a 'Publish' folder adjacent to where we are, or in the parent folder
         task_dir = os.path.dirname(p)
         pub = None
-        
-        # Strategy: Look for 'Publish' in the parent directory of the task path
-        # Assets: Project/Assets/Category/AssetName/mdl/wip/ -> Project/Assets/Category/AssetName/Publish/
-        # Shots: Project/Shots/Seq/Shot/anim/wip/ -> Project/Shots/Seq/Shot/Publish/
-        
+
         check_dir = task_dir
         for _ in range(4): # Search up to 4 levels
             potential_pub = os.path.join(check_dir, 'Publish')
             if os.path.exists(potential_pub):
                 pub = potential_pub
                 break
-            # Also check siblings if 'wip' is in the path
             if os.path.basename(check_dir).lower() == 'wip':
                 sibling_pub = os.path.join(os.path.dirname(check_dir), 'Publish')
                 if os.path.exists(sibling_pub):
@@ -526,58 +528,82 @@ class CGP_OT_PublishAction(bpy.types.Operator):
             if os.path.basename(check_dir) in {'Assets', 'Shots', ''}: break
 
         if not pub:
-            # Fallback to the old logic if discovery fails
             pub = os.path.normpath(os.path.join(os.path.dirname(os.path.dirname(p)), 'Publish'))
-            
-        os.makedirs(pub, exist_ok=True); abbr, fmt = TASK_ABBR.get(t, 'task'), props.format_enum
+
+        abbr, fmt = TASK_ABBR.get(t, 'task'), props.format_enum
         is_anim = props.range_mode != 'STILL'
         s = context.scene.frame_current if props.range_mode == 'STILL' else context.scene.frame_start if props.range_mode == 'SLIDER' else props.start_frame
         ef = context.scene.frame_current if props.range_mode == 'STILL' else context.scene.frame_end if props.range_mode == 'SLIDER' else props.end_frame
-        range_suffix = f'_f{s}_f{ef}'
+        
         def do_export(objs, filename, is_camera=False):
             bpy.ops.object.select_all(action='DESELECT')
+            found_any = False
             for o in objs:
                 if o in bpy.data.objects:
                     bpy.data.objects[o].select_set(True)
+                    found_any = True
                 elif o in bpy.data.collections:
-                    # If it's a collection, select all its objects
                     for co in bpy.data.collections[o].all_objects:
                         co.select_set(True)
+                        found_any = True
             
+            if not found_any:
+                self.report({'WARNING'}, f'No objects found to export for: {filename}')
+                return
+
+            # CRITICAL: Make paths absolute before export so they don't break when file moves
+            bpy.ops.file.make_paths_absolute()
+
             bpy.context.view_layer.update(); f_path = os.path.normpath(os.path.join(pub, filename))
-            if fmt == '.abc': bpy.ops.wm.alembic_export(filepath=f_path, selected=True, start=s, end=ef)
-            elif fmt == '.usd':
-                op = bpy.ops.wm.usd_export; valid = op.get_rna_type().properties.keys()
-                kwargs = {'filepath': f_path}
-                if 'selected_objects_only' in valid: kwargs['selected_objects_only'] = True
-                if is_anim:
-                    if 'export_animation' in valid: kwargs['export_animation'] = True
-                    if 'frame_start' in valid: kwargs['frame_start'], kwargs['frame_end'] = s, ef
-                if 'export_materials' in valid: kwargs['export_materials'] = props.include_materials
-                try: 
-                    bpy.ops.wm.usd_export(**kwargs)
-                    if not props.include_materials:
-                        tp = os.path.join(os.path.dirname(f_path), "textures")
-                        if os.path.exists(tp): shutil.rmtree(tp)
-                except: bpy.ops.wm.usd_export(filepath=f_path)
-            elif fmt == '.fbx':
-                old_s = context.scene.frame_start; old_e = context.scene.frame_end; context.scene.frame_start, context.scene.frame_end = s, ef
-                context.scene.frame_set(s)
-                try: bpy.ops.export_scene.fbx(filepath=f_path, use_selection=True, bake_anim=is_anim, bake_anim_use_all_actions=False, bake_anim_simplify_factor=0.0, add_leaf_bones=False)
-                finally: context.scene.frame_start, context.scene.frame_end = old_s, old_e
-            elif fmt == '.blend': bpy.ops.wm.save_as_mainfile(filepath=f_path, copy=True)
+            
+            if os.path.exists(f_path):
+                try:
+                    if fmt == '.blend': os.remove(f_path)
+                except: pass
+
+            try:
+                if fmt == '.abc': bpy.ops.wm.alembic_export(filepath=f_path, selected=True, start=s, end=ef)
+                elif fmt == '.usd':
+                    op = bpy.ops.wm.usd_export; valid = op.get_rna_type().properties.keys()
+                    kwargs = {'filepath': f_path}
+                    if 'selected_objects_only' in valid: kwargs['selected_objects_only'] = True
+                    if is_anim:
+                        if 'export_animation' in valid: kwargs['export_animation'] = True
+                        if 'frame_start' in valid: kwargs['frame_start'], kwargs['frame_end'] = s, ef
+                    if 'export_materials' in valid: kwargs['export_materials'] = props.include_materials
+                    if 'export_textures' in valid: kwargs['export_textures'] = props.include_materials
+                    if 'relative_paths' in valid: kwargs['relative_paths'] = False
+                    try:
+                        bpy.ops.wm.usd_export(**kwargs)
+                        if not props.include_materials:
+                            tp = os.path.join(os.path.dirname(f_path), 'textures')
+                            if os.path.exists(tp): shutil.rmtree(tp)
+                    except: bpy.ops.wm.usd_export(filepath=f_path)
+                elif fmt == '.fbx':
+                    old_s = context.scene.frame_start; old_e = context.scene.frame_end; context.scene.frame_start, context.scene.frame_end = s, ef      
+                    context.scene.frame_set(s)
+                    try: 
+                        # Use COPY and embed textures for FBX portability
+                        bpy.ops.export_scene.fbx(filepath=f_path, use_selection=True, path_mode='COPY', embed_textures=True, bake_anim=is_anim, bake_anim_use_all_actions=False, bake_anim_simplify_factor=0.0, add_leaf_bones=False)
+                    finally: context.scene.frame_start, context.scene.frame_end = old_s, old_e
+                elif fmt == '.blend':
+                    colls = [bpy.data.collections.get(o) for o in objs if o in bpy.data.collections]
+                    if colls:
+                        bpy.data.libraries.write(f_path, set(colls), fake_user=True)
+                    else:
+                        bpy.ops.wm.save_as_mainfile(filepath=f_path, copy=True)
+            finally:
+                # Revert to relative paths for the current WIP session
+                bpy.ops.file.make_paths_relative()
+
         try:
+            os.makedirs(pub, exist_ok=True)
             if props.publish_separate:
                 for i in props.publish_list:
-                    # Check if it's an object or collection for naming
                     obj = bpy.data.objects.get(i.name)
                     coll = bpy.data.collections.get(i.name)
-                    
                     if not obj and not coll: continue
-                    
                     is_c = obj and (obj.type == 'CAMERA' or 'cam' in obj.name.lower())
-                    
-                    # Naming Logic: Lookdev Special Case
                     if t == 'Lookdev' and fmt in {'.usd', '.blend'}:
                         fn = f'{e}_lkdev{fmt}' if not props.publish_separate else f'{e}_lkdev_{i.name}{fmt}'
                     else:
@@ -586,23 +612,23 @@ class CGP_OT_PublishAction(bpy.types.Operator):
                         else:
                             if c == 'Shots': fn = f'{e}_{abbr}_{i.name}_{ext_upper}{fmt}'
                             else: fn = f'{e}_{abbr}_{i.name}{fmt}'
-                    
                     do_export([i.name], fn, is_camera=is_c)
             else:
-                # Naming Logic: Lookdev Special Case for batch export
                 if t == 'Lookdev' and fmt in {'.usd', '.blend'}:
                     fn = f'{e}_lkdev{fmt}'
                 else:
                     ext_upper = fmt[1:].upper()
-                    if c == 'Shots':
-                        # Project_Shot_Entity_Task_EXT.ext
-                        fn = f'{e}_{abbr}_{ext_upper}{fmt}'
-                    else:
-                        fn = f'{e}_{abbr}{fmt}'
-                
+                    if c == 'Shots': fn = f'{e}_{abbr}_{ext_upper}{fmt}'
+                    else: fn = f'{e}_{abbr}{fmt}'
                 do_export([i.name for i in props.publish_list], fn)
+            
+            self.report({'INFO'}, f'Successfully published to: {pub}')
             return {'FINISHED'}
-        except: return {'CANCELLED'}
+        except Exception as err:
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f'Publish failed: {str(err)}')
+            return {'CANCELLED'}
 
 # --- OPERATORS (ASSEMBLY) ---
 class CGP_OT_AssemblyScan(bpy.types.Operator):
