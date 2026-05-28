@@ -248,6 +248,7 @@ def launch_dcc(dcc_name, exe_path, task_obj, registry_path):
                     "task_id": str(task_obj.get("id", "")),
                     "entity_name": str(task_obj.get("name", "")),
                     "task_type": str(task_obj.get("type", "")),
+                    "category": str(task_obj.get("category", "")),
                     "registry_path": str(registry_path),
                 }
                 try:
