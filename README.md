@@ -9,5 +9,8 @@ CGPipeline is a task-centric VFX/CG pipeline manager designed for speed and simp
 
 
 For now only works with Blender in Windows and MacOS.
+For Maya 2027 only works in Windows env.
 
 Build under Blender 5.1.1
+Build under Maya 2027 (Windows)
+
