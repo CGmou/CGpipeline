@@ -659,28 +659,13 @@ def _pick_file_dialog(files, title):
     return item.data(QtCore.Qt.UserRole) if item else None
 
 
-def op_import_model(mode="reference"):
-    """Bring the current asset's model publish into the scene.
+def _do_import_model(chosen, mode):
+    """Reference or import a specific model publish file.
     mode='reference' — Maya reference (good for lookdev — updates propagate).
     mode='import' — merge into scene as native nodes (good for rig — editable topology).
     """
-    pub = _find_asset_publish_dir()
-    if not pub:
-        cmds.warning(
-            "CGPipeline: Not in an asset context, or asset has no Publish folder yet."
-        )
-        return
-    files = _list_model_publishes(pub)
-    if not files:
-        cmds.warning(f"CGPipeline: No model publishes found in {pub}")
-        return
-
-    chosen = files[0] if len(files) == 1 else _pick_file_dialog(
-        files, f"Pick model to {mode.title()}"
-    )
     if not chosen:
         return
-
     ns = STATE.entity or "model"
     ext = os.path.splitext(chosen)[1].lower()
     label = mode.title()
@@ -723,6 +708,25 @@ def op_import_model(mode="reference"):
         print(f"CGPipeline: {label} model → {chosen}")
     except Exception as e:
         cmds.warning(f"CGPipeline: {label} failed: {e}")
+
+
+def op_import_model(mode="reference"):
+    """Discover the asset's model publishes and reference/import one (picker if many).
+    The LookDev tab lists models directly; this is kept for shelf/standalone use."""
+    pub = _find_asset_publish_dir()
+    if not pub:
+        cmds.warning(
+            "CGPipeline: Not in an asset context, or asset has no Publish folder yet."
+        )
+        return
+    files = _list_model_publishes(pub)
+    if not files:
+        cmds.warning(f"CGPipeline: No model publishes found in {pub}")
+        return
+    chosen = files[0] if len(files) == 1 else _pick_file_dialog(
+        files, f"Pick model to {mode.title()}"
+    )
+    _do_import_model(chosen, mode)
 
 
 # --------------------------------------------------------------------------------------
@@ -811,30 +815,6 @@ def op_import_lookdev(idx):
         cmds.warning(f"CGPipeline: Reference failed: {e}")
 
 
-def op_make_editable():
-    """Maya references are always editable in-place — this is a parity no-op that
-    just confirms the selected node is referenced."""
-    sel = cmds.ls(selection=True) or []
-    if not sel:
-        cmds.warning("CGPipeline: Select a referenced node first.")
-        return
-    referenced = []
-    for n in sel:
-        try:
-            if cmds.referenceQuery(n, isNodeReferenced=True):
-                referenced.append(n)
-        except Exception:
-            pass
-    if not referenced:
-        cmds.warning("CGPipeline: Selection contains no referenced nodes.")
-        return
-    cmds.confirmDialog(
-        title="Editable",
-        message=f"{len(referenced)} referenced node(s) are already editable.\n"
-                "(Maya references don't need a separate override step.)",
-    )
-
-
 def op_assembly_apply(batch=False):
     shot_root = _shot_root_from_task_path()
     if not shot_root:
@@ -916,7 +896,9 @@ class CGPipelinePanel(QtWidgets.QWidget):
         outer.setSpacing(6)
 
         # Always-visible header: dashboard entry point + current task.
-        outer.addWidget(self._btn("Open Dashboard", op_open_dashboard))
+        dash_btn = self._btn("Open Dashboard", op_open_dashboard)
+        dash_btn.setMinimumHeight(48)  # ~2 rows tall
+        outer.addWidget(dash_btn)
         self.task_label = QtWidgets.QLabel("TASK: -")
         self.task_label.setStyleSheet("color: #cccccc; font-weight: bold;")
         outer.addWidget(self.task_label)
@@ -924,7 +906,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         tabs = QtWidgets.QTabWidget()
         outer.addWidget(tabs, 1)
         tabs.addTab(self._make_task_tab(), "Task")
-        tabs.addTab(self._make_model_tab(), "Model")
+        tabs.addTab(self._make_model_tab(), "LookDev")
         tabs.addTab(self._make_publish_tab(), "Publish")
         tabs.addTab(self._make_assembly_tab(), "Assembly")
 
@@ -951,6 +933,30 @@ class CGPipelinePanel(QtWidgets.QWidget):
         row.addWidget(self._btn("Save", op_save))
         row.addWidget(self._btn("Version Up", op_save_version))
         v.addLayout(row)
+
+        v.addStretch()
+        return self._wrap_scroll(w)
+
+    def _make_model_tab(self):
+        # The LookDev stage tab: bring in the asset's model, plus texture tools.
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        # Import Model — list the models available to reference/import.
+        hdr = QtWidgets.QHBoxLayout()
+        hdr.addWidget(self._section("Import Model"))
+        hdr.addStretch()
+        hdr.addWidget(self._btn("Refresh", self._refresh_model_list))
+        v.addLayout(hdr)
+        self.model_list_w = QtWidgets.QListWidget()
+        self.model_list_w.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        v.addWidget(self.model_list_w, 1)
+        mrow = QtWidgets.QHBoxLayout()
+        mrow.addWidget(self._btn("REFERENCE", lambda: self._on_import_model("reference")))
+        mrow.addWidget(self._btn("IMPORT", lambda: self._on_import_model("import")))
+        v.addLayout(mrow)
         v.addWidget(self._sep())
 
         # Textures
@@ -961,25 +967,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         trow.addWidget(self._btn("4K", lambda: op_switch_texture_res("4k")))
         v.addLayout(trow)
 
-        v.addStretch()
-        return self._wrap_scroll(w)
-
-    def _make_model_tab(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
-        v.addWidget(self._section("Import Model"))
-        v.addWidget(QtWidgets.QLabel(
-            "From the current asset's Publish folder.\n"
-            "Reference: lookdev (updates propagate).\n"
-            "Import: rig (native, editable)."
-        ))
-        mrow = QtWidgets.QHBoxLayout()
-        mrow.addWidget(self._btn("REFERENCE", lambda: op_import_model(mode="reference")))
-        mrow.addWidget(self._btn("IMPORT", lambda: op_import_model(mode="import")))
-        v.addLayout(mrow)
-        v.addStretch()
+        self._refresh_model_list()
         return self._wrap_scroll(w)
 
     def _make_publish_tab(self):
@@ -1012,14 +1000,14 @@ class CGPipelinePanel(QtWidgets.QWidget):
         self.end_spin.valueChanged.connect(lambda x: setattr(STATE, "end_frame", x))
         self.start_spin.setEnabled(False)
         self.end_spin.setEnabled(False)
-        crow.addWidget(QtWidgets.QLabel("S:"))
+        crow.addWidget(QtWidgets.QLabel("Start Frame:"))
         crow.addWidget(self.start_spin)
-        crow.addWidget(QtWidgets.QLabel("E:"))
+        crow.addWidget(QtWidgets.QLabel("End Frame:"))
         crow.addWidget(self.end_spin)
         v.addLayout(crow)
 
         opts = QtWidgets.QHBoxLayout()
-        self.separate_chk = QtWidgets.QCheckBox("Separate")
+        self.separate_chk = QtWidgets.QCheckBox("Separate Models")
         self.separate_chk.toggled.connect(lambda c: setattr(STATE, "publish_separate", c))
         opts.addWidget(self.separate_chk)
         self.material_chk = QtWidgets.QCheckBox("Material")
@@ -1052,9 +1040,8 @@ class CGPipelinePanel(QtWidgets.QWidget):
         self.lookdev_list_w = QtWidgets.QListWidget()
         v.addWidget(self.lookdev_list_w, 1)
         v.addWidget(self._btn("REFERENCE LOOKDEV", self._on_import_lookdev))
-        v.addWidget(self._btn("3. MAKE EDITABLE (Maya ref is editable)", op_make_editable))
 
-        v.addWidget(QtWidgets.QLabel("4. ASSIGN CACHES:"))
+        v.addWidget(QtWidgets.QLabel("3. ASSIGN CACHES:"))
         self.collection_tree = QtWidgets.QTreeWidget()
         self.collection_tree.setColumnCount(3)
         self.collection_tree.setHeaderLabels(["Apply", "Group", "Cache"])
@@ -1072,9 +1059,17 @@ class CGPipelinePanel(QtWidgets.QWidget):
         return self._wrap_scroll(w)
 
     # ---- state sync ----
+    def _entity_task_name(self):
+        """e.g. 'buzz_lkdev' / 'buzz_mdl' — entity plus the task abbreviation."""
+        if not STATE.entity:
+            return "None"
+        abbr = TASK_ABBR.get(STATE.task_type, "")
+        return f"{STATE.entity}_{abbr}" if abbr else STATE.entity
+
     def _refresh_state_labels(self):
-        self.task_label.setText(f"TASK: {STATE.entity or 'None'}")
-        self.publish_label.setText(f"PUBLISHING: {STATE.entity or 'None'}")
+        name = self._entity_task_name()
+        self.task_label.setText(f"TASK: {name}")
+        self.publish_label.setText(f"PUBLISHING: {name}")
 
     # ---- handlers ----
     def _on_format_changed(self, t):
@@ -1087,6 +1082,26 @@ class CGPipelinePanel(QtWidgets.QWidget):
         enabled = mode == "CUSTOM"
         self.start_spin.setEnabled(enabled)
         self.end_spin.setEnabled(enabled)
+
+    def _refresh_model_list(self):
+        """Populate the LookDev tab's model list from the current asset's Publish folder."""
+        self.model_list_w.clear()
+        pub = _find_asset_publish_dir()
+        self._model_files = _list_model_publishes(pub) if pub else []
+        for f in self._model_files:
+            self.model_list_w.addItem(os.path.basename(f))
+        if not self._model_files:
+            placeholder = QtWidgets.QListWidgetItem("(no model publishes found)")
+            placeholder.setFlags(QtCore.Qt.NoItemFlags)
+            self.model_list_w.addItem(placeholder)
+
+    def _on_import_model(self, mode):
+        row = self.model_list_w.currentRow()
+        files = getattr(self, "_model_files", [])
+        if row < 0 or row >= len(files):
+            cmds.warning(f"CGPipeline: Select a model to {mode} first.")
+            return
+        _do_import_model(files[row], mode)
 
     def _on_publish_add(self):
         for n in (cmds.ls(selection=True) or []):
@@ -1113,7 +1128,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         op_assembly_scan()
         self.lookdev_list_w.clear()
         for it in STATE.lookdev_items:
-            self.lookdev_list_w.addItem(f"{it['asset_name']} — {it['name']}")
+            self.lookdev_list_w.addItem(it["asset_name"])
         self.collection_tree.clear()
         for l in STATE.collection_links:
             item = QtWidgets.QTreeWidgetItem([
