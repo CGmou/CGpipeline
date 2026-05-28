@@ -191,6 +191,68 @@ def _save_new_scene_if_requested():
         print(f"CGPipeline: Could not initialize new scene: {e}")
 
 
+def _ensure_task_context_from_scene(force=False):
+    """Populate task context from the currently-open scene when the env vars didn't
+    provide it (e.g. the user opened a task file directly via File > Open). Only
+    updates when the scene lives under a CGPipeline project (a folder containing
+    registry.json); otherwise the existing context is left alone."""
+    if not force and STATE.task_path and os.path.isdir(STATE.task_path):
+        return
+    try:
+        scene = cmds.file(q=True, sceneName=True)
+    except Exception:
+        scene = ""
+    if not scene:
+        return
+    task_dir = os.path.dirname(os.path.normpath(scene))
+    cur, reg = task_dir, None
+    for _ in range(12):
+        cand = os.path.join(cur, "registry.json")
+        if os.path.exists(cand):
+            reg = cand
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    if not reg:
+        return  # not a CGPipeline scene — don't clobber existing context
+    STATE.task_path = task_dir
+    STATE.reg_path = reg
+    parts = task_dir.replace("\\", "/").split("/")
+    if "Assets" in parts:
+        idx = parts.index("Assets")
+        STATE.category = "Assets"
+        if len(parts) > idx + 2:
+            STATE.entity = parts[idx + 2]
+    elif "Shots" in parts:
+        idx = parts.index("Shots")
+        STATE.category = "Shots"
+        if len(parts) > idx + 1:
+            STATE.entity = parts[idx + 1]
+
+
+def _on_scene_opened():
+    """Re-derive context from the freshly-opened scene and refresh the panel."""
+    _ensure_task_context_from_scene(force=True)
+    _refresh_panel_state()
+
+
+_scene_job = None
+
+
+def _register_scene_job():
+    """Refresh the panel whenever a scene is opened, so switching tasks in an
+    already-running Maya re-populates LookDev + Assembly automatically."""
+    global _scene_job
+    if _scene_job is not None:
+        return
+    try:
+        _scene_job = cmds.scriptJob(event=["SceneOpened", _on_scene_opened], protected=True)
+    except Exception:
+        _scene_job = None
+
+
 # --------------------------------------------------------------------------------------
 # Same-session command listener + heartbeat
 # --------------------------------------------------------------------------------------
@@ -884,6 +946,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         self.resize(360, 720)
         self._build()
         self._refresh_state_labels()
+        self._auto_populate()
 
     # ---- builders ----
     def _btn(self, text, fn):
@@ -1089,6 +1152,20 @@ class CGPipelinePanel(QtWidgets.QWidget):
     def _refresh_state_labels(self):
         self.task_label.setText(f"TASK: {self._entity_task_name()}")
 
+    def _auto_populate(self):
+        """Refresh the LookDev model list and Assembly scan for the current task.
+        Runs on panel open and whenever the active task changes."""
+        _ensure_task_context_from_scene()
+        try:
+            self._refresh_model_list()
+        except Exception:
+            pass
+        if STATE.task_path or STATE.reg_path:
+            try:
+                self._on_assembly_scan()
+            except Exception:
+                pass
+
     # ---- handlers ----
     def _on_format_changed(self, t):
         STATE.publish_format = t
@@ -1209,6 +1286,7 @@ def _refresh_panel_state():
     if panel is not None:
         try:
             panel._refresh_state_labels()
+            panel._auto_populate()
         except Exception:
             pass
 
@@ -1268,6 +1346,7 @@ def _ensure_shelf():
 # --------------------------------------------------------------------------------------
 def initialize():
     _read_env_into_state()
+    _ensure_task_context_from_scene()     # fall back to the open scene if env had no task
     _set_project_workspace()
     _load_plugins()
     _save_new_scene_if_requested()
@@ -1275,7 +1354,8 @@ def initialize():
     _start_command_watcher()
     _touch_session()                      # advertise immediately, before the first timer tick
     atexit.register(_remove_session)      # best-effort cleanup on Maya quit
+    _register_scene_job()                 # auto-refresh the panel when a task scene is opened
     _ensure_shelf()
-    if STATE.task_id and not cmds.about(batch=True):
+    if (STATE.task_id or STATE.task_path) and not cmds.about(batch=True):
         show_panel()
     print("CGPipeline: Maya integration ready.")
