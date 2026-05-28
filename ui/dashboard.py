@@ -88,7 +88,7 @@ class Dashboard(QWidget):
                 widget = grid.itemAt(i).widget()
                 if widget: widget.setParent(None)
 
-        current_username = self.registry.data.get("current_user", "Unknown")
+        current_username = self.registry.current_user
         filtered_tasks = []
         for t in self.registry.tasks:
             if is_admin or t.get("assigned_to") == current_username:

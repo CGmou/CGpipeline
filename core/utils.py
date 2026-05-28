@@ -5,6 +5,21 @@ ASSET_GROUP_ABBR = {
     "Char": "CH", "Props": "PR", "Sets": "ST", "Vehicles": "VH"
 }
 
+def is_safe_subpath(target, root):
+    """True only when `target` resolves to a path strictly inside `root`.
+    Used as a guard before destructive operations like shutil.rmtree."""
+    if not target or not root:
+        return False
+    try:
+        target_abs = os.path.abspath(target)
+        root_abs = os.path.abspath(root)
+        if target_abs == root_abs:
+            return False
+        return os.path.commonpath([target_abs, root_abs]) == root_abs
+    except ValueError:
+        # Different drives on Windows raise ValueError
+        return False
+
 TASK_ABBR = {
     "Model": "mdl", "Texture": "txt", "Lookdev": "lkdev", "Rig": "rig",
     "Animation": "anim", "Layout": "lo", "Blocking": "blk", "Lighting": "lgt",

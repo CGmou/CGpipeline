@@ -2,6 +2,7 @@
 import json
 import uuid
 from datetime import datetime
+from .utils import is_safe_subpath
 
 class HubManager:
     def __init__(self, system_root):
@@ -105,12 +106,15 @@ class HubManager:
         if target_project:
             project_path = target_project.get("path")
             if project_path and os.path.exists(project_path):
-                try:
-                    import shutil
-                    shutil.rmtree(project_path)
-                except Exception as e:
-                    print(f"CGPipeline Error: Failed to remove project folder: {e}")
-            
+                if not is_safe_subpath(project_path, self.project_root):
+                    print(f"CGPipeline Error: Refusing to delete project folder outside the active root: {project_path}")
+                else:
+                    try:
+                        import shutil
+                        shutil.rmtree(project_path)
+                    except Exception as e:
+                        print(f"CGPipeline Error: Failed to remove project folder: {e}")
+
             self.projects = [p for p in self.projects if p["id"] != project_id]
             self.save_projects()
             return True
