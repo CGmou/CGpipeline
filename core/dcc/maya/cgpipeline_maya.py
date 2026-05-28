@@ -290,7 +290,18 @@ def op_open_dashboard():
         py_exe = shutil.which("pythonw") or shutil.which("python") or "python"
     else:
         py_exe = shutil.which("python3") or shutil.which("python") or "python3"
+    # Launch with a CLEANED environment. If we inherit Maya's env, PYTHONHOME /
+    # PYTHONPATH point at Maya's own interpreter + its bundled PySide6/Qt, so the
+    # system Python running main.py loads Maya's libraries and breaks — the dashboard
+    # opens against the wrong interpreter and can't load projects/tasks. Strip the
+    # Python/Qt/loader vars so the external Python uses its own stdlib + site-packages.
     env = os.environ.copy()
+    for var in (
+        "PYTHONHOME", "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
+        "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+        "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH",
+    ):
+        env.pop(var, None)
     env["CGP_IN_DCC"] = "Maya"
     env["CGP_COMMAND_FILE"] = COMMAND_FILE
     if STATE.task_id:
@@ -299,7 +310,7 @@ def op_open_dashboard():
         env["CGP_REGISTRY_PATH"] = STATE.reg_path
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        subprocess.Popen([py_exe, main_py], env=env, creationflags=creationflags)
+        subprocess.Popen([py_exe, main_py], env=env, cwd=root, creationflags=creationflags)
         print("CGPipeline: Dashboard launched (linked to this Maya).")
     except Exception as e:
         cmds.warning(f"CGPipeline: Dashboard launch failed: {e}")
