@@ -126,6 +126,10 @@ class CGPipelineApp(QMainWindow):
 
         self.auth = AuthManager(system_root)
         self.hub = HubManager(system_root)
+        # One shared Kitsu session for the whole app so connection state is
+        # consistent between the Kitsu dialog and the project hub.
+        from core.kitsu import KitsuManager
+        self.kitsu = KitsuManager()
 
         self.setup_menubar()
         self.stack = QStackedWidget()
@@ -178,7 +182,7 @@ class CGPipelineApp(QMainWindow):
     def on_open_kitsu(self):
         # Imported lazily so the app starts even if gazu isn't installed.
         from ui.kitsu_dialog import KitsuDialog
-        dialog = KitsuDialog(self.auth, self.hub, self)
+        dialog = KitsuDialog(self.auth, self.hub, self.kitsu, self)
         dialog.imported.connect(self.on_kitsu_imported)
         dialog.exec()
 
@@ -200,7 +204,7 @@ class CGPipelineApp(QMainWindow):
         self.show_hub()
 
     def show_hub(self):
-        self.hub_view = ProjectHubView(self.hub, self.auth)
+        self.hub_view = ProjectHubView(self.hub, self.auth, kitsu=self.kitsu)
         self.hub_view.project_selected.connect(self.on_project_selected)
         self.stack.addWidget(self.hub_view)
         self.stack.setCurrentWidget(self.hub_view)

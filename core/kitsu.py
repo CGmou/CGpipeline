@@ -42,6 +42,17 @@ TASK_TYPE_MAP = {
     "assembly": "Assembly",
 }
 
+# Reverse maps for uploading CGPipeline -> Kitsu.
+SUBCAT_TO_KITSU_ASSET_TYPE = {
+    "Char": "Character", "Props": "Prop", "Sets": "Environment", "Vehicles": "Vehicle",
+}
+CGP_TO_KITSU_TASK_TYPE = {
+    "Model": "Modeling", "Texture": "Texture", "Lookdev": "Shading", "Rig": "Rigging",
+    "Animation": "Animation", "Layout": "Layout", "Blocking": "Blocking",
+    "Lighting": "Lighting", "Comp": "Compositing", "FX": "FX", "CFX": "CFX",
+    "Assembly": "Assembly", "Setdress": "Set Dressing",
+}
+
 # Kitsu task status name/short-name (lowercased) -> CGPipeline status.
 STATUS_MAP = {
     "todo": "Ready", "ready to start": "Ready", "ready": "Ready",
@@ -144,6 +155,19 @@ class KitsuManager:
         self.connected = False
         self.user_name = ""
 
+    def ensure_connected(self, auth):
+        """Reconnect using saved credentials if not already connected.
+        Returns (ok, message)."""
+        if self.connected:
+            return True, "Connected"
+        s = auth.settings
+        host = s.get("kitsu_host", "")
+        email = s.get("kitsu_email", "")
+        pw = s.get("kitsu_pass", "")
+        if host and email and pw:
+            return self.connect(host, email, pw)
+        return False, "Not connected to Kitsu. Open Kitsu → Production Tracker and connect first."
+
     def list_projects(self):
         """Return Kitsu project dicts. Open projects first, falling back to all."""
         import gazu
@@ -184,6 +208,17 @@ class KitsuManager:
             project = hub.create_project(name, root_dir, fps=fps)
         if not project:
             return {"ok": False, "error": "Could not create local project."}
+
+        # Tag the local project as Kitsu-linked so the hub can mark it visually.
+        try:
+            hub.update_project(
+                project["id"],
+                kitsu_id=kitsu_project.get("id", ""),
+                kitsu_host=self.host,
+            )
+            project["kitsu_id"] = kitsu_project.get("id", "")
+        except Exception:
+            pass
 
         registry = TaskRegistry(project["path"])
         if current_user:
@@ -295,3 +330,151 @@ class KitsuManager:
                 totals["skipped"] += s.get("skipped", 0)
                 totals["names"].append(s.get("project", ""))
         return totals
+
+    def upload_project_to_kitsu(self, local_project, hub, progress=None):
+        """Push a local CGPipeline project up to Kitsu (one-way: pipeline -> Kitsu),
+        creating the project plus its assets, shots, and tasks, then linking the
+        local project to the new Kitsu project. Every Kitsu call is defensive so a
+        permission/server hiccup on one entity doesn't abort the whole upload."""
+        import gazu
+
+        if not self.connected:
+            return {"ok": False, "error": "Not connected to Kitsu."}
+
+        name = local_project.get("name", "Project")
+        try:
+            kproj = gazu.project.get_project_by_name(name)
+        except Exception:
+            kproj = None
+        if not kproj:
+            try:
+                kproj = gazu.project.new_project(name)
+            except Exception as e:
+                return {"ok": False, "error": f"Could not create project on Kitsu: {e}"}
+
+        # Best-effort fps.
+        fps = local_project.get("fps")
+        if fps:
+            try:
+                kproj["fps"] = str(fps)
+                gazu.project.update_project(kproj)
+            except Exception:
+                pass
+
+        summary = {"ok": True, "project": name, "assets": 0, "shots": 0, "tasks": 0, "skipped": 0}
+
+        registry = TaskRegistry(local_project["path"])
+        # Group local tasks by entity (name + category + sub-category).
+        entities = {}
+        for t in registry.tasks:
+            key = (t.get("name"), t.get("category"), t.get("sub_category", ""))
+            entities.setdefault(key, []).append(t)
+
+        at_cache, seq_cache, tt_cache = {}, {}, {}
+
+        def get_task_type(cgp_type):
+            kname = CGP_TO_KITSU_TASK_TYPE.get(cgp_type, cgp_type)
+            if kname in tt_cache:
+                return tt_cache[kname]
+            tt = None
+            try:
+                tt = gazu.task.get_task_type_by_name(kname)
+            except Exception:
+                tt = None
+            tt_cache[kname] = tt
+            return tt
+
+        items = list(entities.items())
+        total = len(items)
+        for i, ((ename, category, sub), tlist) in enumerate(items):
+            if progress:
+                try:
+                    progress(ename, i + 1, total)
+                except Exception:
+                    pass
+
+            kentity = None
+            try:
+                if category == "Assets":
+                    at_name = SUBCAT_TO_KITSU_ASSET_TYPE.get(sub, "Prop")
+                    at = at_cache.get(at_name)
+                    if at is None:
+                        try:
+                            at = gazu.asset.get_asset_type_by_name(at_name)
+                        except Exception:
+                            at = None
+                        if not at:
+                            try:
+                                at = gazu.asset.new_asset_type(at_name)
+                            except Exception:
+                                at = None
+                        at_cache[at_name] = at
+                    if at:
+                        try:
+                            kentity = gazu.asset.get_asset_by_name(kproj, ename)
+                        except Exception:
+                            kentity = None
+                        if not kentity:
+                            kentity = gazu.asset.new_asset(kproj, at, ename)
+                        summary["assets"] += 1
+                else:
+                    seq_name = ename.split("_")[0] if "_" in ename else "seq01"
+                    seq = seq_cache.get(seq_name)
+                    if seq is None:
+                        try:
+                            seq = gazu.shot.get_sequence_by_name(kproj, seq_name)
+                        except Exception:
+                            seq = None
+                        if not seq:
+                            try:
+                                seq = gazu.shot.new_sequence(kproj, seq_name)
+                            except Exception:
+                                seq = None
+                        seq_cache[seq_name] = seq
+                    if seq:
+                        fin = fout = None
+                        for t in tlist:
+                            if t.get("frame_start") is not None and t.get("frame_end") is not None:
+                                fin, fout = t["frame_start"], t["frame_end"]
+                                break
+                        try:
+                            kentity = gazu.shot.get_shot_by_name(seq, ename)
+                        except Exception:
+                            kentity = None
+                        if not kentity:
+                            kwargs = {}
+                            if fin is not None and fout is not None:
+                                kwargs["frame_in"], kwargs["frame_out"] = fin, fout
+                            kentity = gazu.shot.new_shot(kproj, seq, ename, **kwargs)
+                        summary["shots"] += 1
+            except Exception as e:
+                print(f"CGPipeline Kitsu upload: entity '{ename}' failed: {e}")
+                kentity = None
+
+            if not kentity:
+                continue
+
+            for t in tlist:
+                tt = get_task_type(t.get("type"))
+                if not tt:
+                    summary["skipped"] += 1
+                    continue
+                try:
+                    gazu.task.new_task(kentity, tt)
+                    summary["tasks"] += 1
+                except Exception:
+                    # Most likely the task already exists on this entity.
+                    summary["skipped"] += 1
+
+        # Link the local project to the new Kitsu project.
+        try:
+            hub.update_project(
+                local_project["id"],
+                kitsu_id=kproj.get("id", ""),
+                kitsu_host=self.host,
+            )
+        except Exception:
+            pass
+
+        summary["kitsu_id"] = kproj.get("id", "")
+        return summary

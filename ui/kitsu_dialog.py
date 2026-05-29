@@ -13,11 +13,11 @@ class KitsuDialog(QDialog):
 
     imported = Signal()  # emitted after a successful sync so the hub can refresh
 
-    def __init__(self, auth_manager, hub_manager, parent=None):
+    def __init__(self, auth_manager, hub_manager, kitsu=None, parent=None):
         super().__init__(parent)
         self.auth = auth_manager
         self.hub = hub_manager
-        self.kitsu = KitsuManager()
+        self.kitsu = kitsu or KitsuManager()
 
         self.setWindowTitle("Kitsu Production Tracker")
         self.setMinimumWidth(480)
@@ -163,7 +163,12 @@ class KitsuDialog(QDialog):
         self.remember_chk.setChecked(bool(s.get("kitsu_remember", False)))
         if s.get("kitsu_remember") and s.get("kitsu_pass"):
             self.pass_edit.setText(s.get("kitsu_pass", ""))
-            # Auto-connect so the user lands on the clean connected view.
+        # If the shared session is already connected, just show that. Otherwise
+        # auto-connect from remembered credentials so the user lands on the
+        # clean connected view.
+        if self.kitsu.connected:
+            self._show_state()
+        elif s.get("kitsu_remember") and s.get("kitsu_pass"):
             self._connect(silent=True)
 
     # ---- handlers ----
