@@ -3,6 +3,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QColor, QAction
 import os
 from core.utils import get_latest_version, build_work_filename
+from core.constants import STATUS_COLORS
 
 class TaskCard(QFrame):
     clicked = Signal(str)
@@ -28,8 +29,8 @@ class TaskCard(QFrame):
         border_color = "#3D3D3D"
         bg_color = "#2D2D2D"
         is_critical = any(t.get("priority") in ["High", "Critical"] for t in self.task_data.get("all_task_objs", []))
-        is_done = all(t.get("status") == "Approved" for t in self.task_data.get("all_task_objs", []))
-        is_pending = any(t.get("status") == "Pending Review" for t in self.task_data.get("all_task_objs", []))
+        is_done = all(t.get("status") == "Done" for t in self.task_data.get("all_task_objs", []))
+        is_pending = any(t.get("status") == "Waiting For Approval" for t in self.task_data.get("all_task_objs", []))
 
         if is_critical:
             border_color = "#A72828"; bg_color = "#3A1A1A"
@@ -110,9 +111,9 @@ class TaskCard(QFrame):
 
             t_status = QLabel(task_obj["status"])
             t_status.setObjectName("TaskStatus")
-            if task_obj["status"] == "Approved": t_status.setStyleSheet("color: #28A745;")
-            elif task_obj["status"] == "Pending Review": t_status.setStyleSheet("color: #0078D4;")
-            elif task_obj["status"] == "In Progress": t_status.setStyleSheet("color: #FFC107;")
+            status_color = STATUS_COLORS.get(task_obj["status"])
+            if status_color:
+                t_status.setStyleSheet(f"color: {status_color};")
             row_layout.addWidget(t_status)
 
             task_list_layout.addWidget(row)

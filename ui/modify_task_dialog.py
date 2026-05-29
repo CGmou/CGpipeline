@@ -2,6 +2,7 @@
                              QComboBox, QFormLayout, QHBoxLayout, QListWidget, QListWidgetItem, QFileDialog, QScrollArea, QWidget, QFrame, QCheckBox)
 from PySide6.QtCore import Qt, Signal
 import os
+from core.constants import TASK_STATUSES, DEFAULT_STATUS
 
 class TaskRow(QFrame):
     def __init__(self, task_obj, users):
@@ -26,8 +27,8 @@ class TaskRow(QFrame):
         layout.addWidget(self.type_label)
 
         self.status_combo = QComboBox()
-        self.status_combo.addItems(["Ready", "In Progress", "Pending Review", "Approved", "Omit"])
-        self.status_combo.setCurrentText(task_obj.get("status", "Ready"))
+        self.status_combo.addItems(TASK_STATUSES)
+        self.status_combo.setCurrentText(task_obj.get("status", DEFAULT_STATUS))
         layout.addWidget(self.status_combo)
 
         self.priority_combo = QComboBox()

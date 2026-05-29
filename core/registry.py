@@ -5,6 +5,7 @@ import shutil
 from datetime import datetime
 from .folder_template import create_asset_structure, create_shot_structure, create_project_base
 from .utils import is_safe_subpath
+from .constants import DEFAULT_STATUS, LEGACY_STATUS_MIGRATION
 
 class TaskRegistry:
     def __init__(self, root_path):
@@ -43,7 +44,14 @@ class TaskRegistry:
                         task["sub_category"] = "Legacy"; needs_save = True
                     if "priority" not in task:
                         task["priority"] = "Normal"; needs_save = True
-                    
+
+                    # Migrate legacy status names to the Kitsu-aligned vocabulary.
+                    st = task.get("status")
+                    if st in LEGACY_STATUS_MIGRATION:
+                        task["status"] = LEGACY_STATUS_MIGRATION[st]; needs_save = True
+                    elif not st:
+                        task["status"] = DEFAULT_STATUS; needs_save = True
+
                     # Cross-platform fix: resolve absolute paths from other systems
                     old_path = task.get("path", "")
                     if old_path and not os.path.exists(old_path):
@@ -109,7 +117,7 @@ class TaskRegistry:
         task = {
             "id": task_id, "name": name, "category": category, "sub_category": sub_category,
             "type": task_type, "path": task_path, "thumbnail": thumbnail,
-            "status": "Ready", "priority": "Normal", "assigned_to": self.current_user,
+            "status": DEFAULT_STATUS, "priority": "Normal", "assigned_to": self.current_user,
             "created_at": datetime.now().isoformat()
         }
         self.data["tasks"].append(task)

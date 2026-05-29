@@ -154,7 +154,7 @@ class CGP_WindowManagerProps(bpy.types.PropertyGroup):
     format_enum: bpy.props.EnumProperty(name='Format', items=[('.abc', 'Alembic', ''), ('.usd', 'USD', ''), ('.fbx', 'FBX', ''), ('.blend', 'Blender', '')])
     range_mode: bpy.props.EnumProperty(name='Range', items=[('STILL', 'Still', ''), ('SLIDER', 'Slider', ''), ('CUSTOM', 'Custom', '')])
     start_frame: bpy.props.IntProperty(name='Start', default=1001); end_frame: bpy.props.IntProperty(name='End', default=1100)
-    status_enum: bpy.props.EnumProperty(name='Status', items=[('NO CHANGE', 'NO CHANGE', ''), ('Pending Review', 'Pending Review', ''), ('Approved', 'Approved', ''), ('In Progress', 'In Progress', '')])
+    status_enum: bpy.props.EnumProperty(name='Status', items=[('NO CHANGE', 'NO CHANGE', ''), ('Todo', 'Todo', ''), ('Work In Progress', 'Work In Progress', ''), ('Waiting For Approval', 'Waiting For Approval', ''), ('Retake', 'Retake', ''), ('Done', 'Done', '')])
     publish_separate: bpy.props.BoolProperty(name='Separate', default=False)
     include_materials: bpy.props.BoolProperty(name='Include Material', default=True)
     

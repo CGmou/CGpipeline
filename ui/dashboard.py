@@ -2,6 +2,7 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction
 from .task_card import TaskCard
+from core.constants import DEFAULT_STATUS
 
 class Dashboard(QWidget):
     modify_requested = Signal(str)
@@ -110,7 +111,7 @@ class Dashboard(QWidget):
 
             task_info = []
             for t in tasks:
-                task_info.append({"type": t["type"], "status": t.get("status", "Ready")})
+                task_info.append({"type": t["type"], "status": t.get("status", DEFAULT_STATUS)})
             display_data["combined_tasks"] = task_info
             display_data["all_task_objs"] = tasks
             display_data["current_user"] = current_username
