@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QPushButton,
-    QLabel, QCheckBox, QListWidget, QListWidgetItem, QGroupBox, QMessageBox, QApplication
+    QLabel, QCheckBox, QWidget, QMessageBox, QApplication
 )
 from PySide6.QtCore import Qt, Signal
 import os
@@ -9,9 +9,9 @@ from core.kitsu import KitsuManager
 
 
 class KitsuDialog(QDialog):
-    """Connect to a Kitsu server and import its projects into CGPipeline."""
+    """Connect to a Kitsu server and sync its projects into the CGPipeline hub."""
 
-    imported = Signal()  # emitted after a successful import so the hub can refresh
+    imported = Signal()  # emitted after a successful sync so the hub can refresh
 
     def __init__(self, auth_manager, hub_manager, parent=None):
         super().__init__(parent)
@@ -20,29 +20,26 @@ class KitsuDialog(QDialog):
         self.kitsu = KitsuManager()
 
         self.setWindowTitle("Kitsu Production Tracker")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(480)
         self.setStyleSheet("""
             QDialog { background-color: #1E1E1E; }
             QLabel { color: #BBB; }
-            QGroupBox { color: #DDD; border: 1px solid #333; border-radius: 6px; margin-top: 10px; padding-top: 12px; font-weight: bold; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
             QLineEdit { background-color: #2D2D2D; border: 1px solid #3D3D3D; color: white; padding: 8px; border-radius: 4px; }
-            QListWidget { background-color: #2D2D2D; border: 1px solid #3D3D3D; color: white; border-radius: 4px; }
             QCheckBox { color: #BBB; }
             QPushButton { background-color: #444; color: white; border: none; padding: 8px 15px; border-radius: 4px; }
             QPushButton:hover { background-color: #555; }
             QPushButton:disabled { background-color: #2A2A2A; color: #666; }
             #PrimaryBtn { background-color: #0078D4; font-weight: bold; }
             #PrimaryBtn:hover { background-color: #1086E0; }
+            #ConnectedCard { background-color: #15301A; border: 1px solid #2c5a34; border-radius: 6px; }
         """)
         self.setup_ui()
         self._prefill()
 
     def setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-
-        layout.addWidget(QLabel("KITSU PRODUCTION TRACKER"))
+        self.layout = QVBoxLayout(self)
+        self.layout.setSpacing(12)
+        self.layout.addWidget(QLabel("KITSU PRODUCTION TRACKER"))
 
         if not KitsuManager.available():
             warn = QLabel(
@@ -52,71 +49,110 @@ class KitsuDialog(QDialog):
             )
             warn.setStyleSheet("color: #E0A030; padding: 10px; border: 1px solid #5a4a20; border-radius: 4px;")
             warn.setWordWrap(True)
-            layout.addWidget(warn)
+            self.layout.addWidget(warn)
             close_btn = QPushButton("Close")
             close_btn.clicked.connect(self.reject)
-            layout.addWidget(close_btn)
+            self.layout.addWidget(close_btn)
             return
 
-        # --- Connection ---
-        conn_box = QGroupBox("Connection")
-        conn_form = QFormLayout(conn_box)
+        self._build_login_form()
+        self._build_connected_panel()
+        self._show_state()
+
+    # ---- login form (shown when disconnected) ----
+    def _build_login_form(self):
+        self.conn_widget = QWidget()
+        form = QFormLayout(self.conn_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+
         self.host_edit = QLineEdit()
         self.host_edit.setPlaceholderText("https://your-studio.cg-wire.com")
         self.email_edit = QLineEdit()
         self.email_edit.setPlaceholderText("you@studio.com")
         self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(QLineEdit.Password)
+        self.pass_edit.returnPressed.connect(self.on_connect)
         self.remember_chk = QCheckBox("Remember credentials on this machine")
-        conn_form.addRow("Host:", self.host_edit)
-        conn_form.addRow("Email:", self.email_edit)
-        conn_form.addRow("Password:", self.pass_edit)
-        conn_form.addRow("", self.remember_chk)
+
+        form.addRow("Host:", self.host_edit)
+        form.addRow("Email:", self.email_edit)
+        form.addRow("Password:", self.pass_edit)
+        form.addRow("", self.remember_chk)
 
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setObjectName("PrimaryBtn")
         self.connect_btn.clicked.connect(self.on_connect)
-        conn_form.addRow(self.connect_btn)
+        form.addRow(self.connect_btn)
 
         self.status_label = QLabel("Not connected.")
         self.status_label.setStyleSheet("color: #888; font-size: 11px;")
         self.status_label.setWordWrap(True)
-        conn_form.addRow(self.status_label)
-        layout.addWidget(conn_box)
+        form.addRow(self.status_label)
 
-        # --- Projects / Import ---
-        self.import_box = QGroupBox("Import Projects")
-        imp_layout = QVBoxLayout(self.import_box)
+        self.layout.addWidget(self.conn_widget)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Kitsu projects:"))
-        row.addStretch()
-        self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.clicked.connect(self.load_projects)
-        row.addWidget(self.refresh_btn)
-        imp_layout.addLayout(row)
+    # ---- connected panel (shown when connected) ----
+    def _build_connected_panel(self):
+        self.connected_widget = QWidget()
+        v = QVBoxLayout(self.connected_widget)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
 
-        self.project_list = QListWidget()
-        self.project_list.setMinimumHeight(160)
-        imp_layout.addWidget(self.project_list)
+        card = QWidget()
+        card.setObjectName("ConnectedCard")
+        cv = QVBoxLayout(card)
+        self.user_label = QLabel("Connected")
+        self.user_label.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 14px;")
+        self.host_label = QLabel("")
+        self.host_label.setStyleSheet("color: #9cc79f; font-size: 11px;")
+        self.host_label.setWordWrap(True)
+        cv.addWidget(self.user_label)
+        cv.addWidget(self.host_label)
+        v.addWidget(card)
 
         self.dest_label = QLabel()
         self.dest_label.setStyleSheet("color: #888; font-size: 11px;")
         self.dest_label.setWordWrap(True)
-        imp_layout.addWidget(self.dest_label)
+        v.addWidget(self.dest_label)
 
-        self.import_btn = QPushButton("Import Selected Project")
-        self.import_btn.setObjectName("PrimaryBtn")
-        self.import_btn.clicked.connect(self.on_import)
-        imp_layout.addWidget(self.import_btn)
-
-        self.import_box.setEnabled(False)
-        layout.addWidget(self.import_box)
+        self.sync_btn = QPushButton("Sync All Projects from Kitsu")
+        self.sync_btn.setObjectName("PrimaryBtn")
+        self.sync_btn.clicked.connect(self.on_sync_all)
+        v.addWidget(self.sync_btn)
 
         self.summary_label = QLabel("")
         self.summary_label.setStyleSheet("color: #BBB; font-size: 11px;")
         self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
+        v.addWidget(self.summary_label)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        self.disconnect_btn = QPushButton("Disconnect")
+        self.disconnect_btn.clicked.connect(self.on_disconnect)
+        row.addWidget(self.disconnect_btn)
+        v.addLayout(row)
+
+        self.layout.addWidget(self.connected_widget)
+
+    # ---- state ----
+    def _show_state(self):
+        connected = self.kitsu.connected
+        self.conn_widget.setVisible(not connected)
+        self.connected_widget.setVisible(connected)
+        if connected:
+            self.user_label.setText(f"Connected as {self.kitsu.user_name}")
+            self.host_label.setText(self.kitsu.host)
+            self._update_dest_label()
+        self.adjustSize()
+
+    def _update_dest_label(self):
+        root = self.auth.settings.get("project_root", "")
+        if root:
+            self.dest_label.setText(f"Projects will sync into:\n{root}")
+        else:
+            self.dest_label.setText(
+                "⚠ No project root set. Set one in Settings → Project Root before syncing."
+            )
 
     def _prefill(self):
         if not KitsuManager.available():
@@ -127,22 +163,19 @@ class KitsuDialog(QDialog):
         self.remember_chk.setChecked(bool(s.get("kitsu_remember", False)))
         if s.get("kitsu_remember") and s.get("kitsu_pass"):
             self.pass_edit.setText(s.get("kitsu_pass", ""))
-        self._update_dest_label()
-
-    def _update_dest_label(self):
-        root = self.auth.settings.get("project_root", "")
-        if root:
-            self.dest_label.setText(f"Imported into project root:\n{root}")
-        else:
-            self.dest_label.setText(
-                "⚠ No project root set. Set one in Settings → Project Root before importing."
-            )
+            # Auto-connect so the user lands on the clean connected view.
+            self._connect(silent=True)
 
     # ---- handlers ----
-    def on_connect(self):
+    def _connect(self, silent=False):
         host = self.host_edit.text().strip()
         email = self.email_edit.text().strip()
         password = self.pass_edit.text()
+        if not (host and email and password):
+            if not silent:
+                self.status_label.setStyleSheet("color: #E06060; font-size: 11px;")
+                self.status_label.setText("Enter host, email, and password.")
+            return False
 
         self.status_label.setText("Connecting…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -151,12 +184,10 @@ class KitsuDialog(QDialog):
         finally:
             QApplication.restoreOverrideCursor()
 
-        self.status_label.setText(msg)
         if not ok:
             self.status_label.setStyleSheet("color: #E06060; font-size: 11px;")
-            return
-
-        self.status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+            self.status_label.setText(msg)
+            return False
 
         # Persist connection settings.
         self.auth.settings["kitsu_host"] = host
@@ -165,77 +196,56 @@ class KitsuDialog(QDialog):
         self.auth.settings["kitsu_pass"] = password if self.remember_chk.isChecked() else ""
         self.auth.save()
 
-        self.import_box.setEnabled(True)
-        self._update_dest_label()
-        self.load_projects()
+        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+        self.status_label.setText("Not connected.")
+        self._show_state()
+        return True
 
-    def load_projects(self):
-        self.project_list.clear()
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            projects = self.kitsu.list_projects()
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Kitsu", f"Could not load projects:\n{e}")
-            return
-        QApplication.restoreOverrideCursor()
+    def on_connect(self):
+        self._connect(silent=False)
 
-        for p in sorted(projects, key=lambda x: x.get("name", "").lower()):
-            item = QListWidgetItem(p.get("name", "Unnamed"))
-            item.setData(Qt.UserRole, p)
-            self.project_list.addItem(item)
+    def on_disconnect(self):
+        self.kitsu.disconnect()
+        self.summary_label.setText("")
+        self._show_state()
 
-        if not projects:
-            self.summary_label.setText("No projects found on this Kitsu server.")
-
-    def on_import(self):
+    def on_sync_all(self):
         root = self.auth.settings.get("project_root", "")
         if not root or not os.path.exists(root):
             QMessageBox.warning(
                 self, "Project Root Required",
-                "Set a project root in Settings → Project Root before importing."
+                "Set a project root in Settings → Project Root before syncing."
             )
             return
-
-        item = self.project_list.currentItem()
-        if not item:
-            QMessageBox.information(self, "Kitsu", "Select a project to import.")
-            return
-        kitsu_project = item.data(Qt.UserRole)
 
         current_user = ""
         if self.auth.current_user:
             current_user = self.auth.current_user.get("username", "")
 
-        def progress(msg, cur, total):
-            self.summary_label.setText(f"Importing… {msg} ({cur}/{total})")
+        def progress(name, cur, total):
+            self.summary_label.setText(f"Syncing… {name} ({cur}/{total})")
             QApplication.processEvents()
 
-        self.import_btn.setEnabled(False)
+        self.sync_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            summary = self.kitsu.import_project(
-                kitsu_project, self.hub, root,
-                current_user=current_user, progress=progress,
+            totals = self.kitsu.import_all_projects(
+                self.hub, root, current_user=current_user, progress=progress,
             )
         except Exception as e:
             QApplication.restoreOverrideCursor()
-            self.import_btn.setEnabled(True)
-            QMessageBox.critical(self, "Kitsu Import Failed", str(e))
+            self.sync_btn.setEnabled(True)
+            QMessageBox.critical(self, "Kitsu Sync Failed", str(e))
             return
         finally:
             QApplication.restoreOverrideCursor()
-            self.import_btn.setEnabled(True)
-
-        if not summary.get("ok"):
-            QMessageBox.warning(self, "Kitsu", summary.get("error", "Import failed."))
-            return
+            self.sync_btn.setEnabled(True)
 
         self.summary_label.setText(
-            f"Imported '{summary['project']}': "
-            f"{summary['assets']} assets, {summary['shots']} shots, "
-            f"{summary['tasks']} tasks created"
-            + (f" ({summary['skipped']} skipped)" if summary.get("skipped") else "")
+            f"Synced {totals['projects']} project(s): "
+            f"{totals['assets']} assets, {totals['shots']} shots, "
+            f"{totals['tasks']} tasks"
+            + (f" ({totals['skipped']} skipped)" if totals.get("skipped") else "")
             + "."
         )
         self.imported.emit()

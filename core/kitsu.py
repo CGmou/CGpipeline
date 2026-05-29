@@ -86,6 +86,7 @@ class KitsuManager:
         self.connected = False
         self.host = ""
         self.email = ""
+        self.user_name = ""
 
     @staticmethod
     def available():
@@ -108,7 +109,7 @@ class KitsuManager:
             return False, "Please enter a Kitsu host URL."
         try:
             gazu.set_host(api_host)
-            gazu.log_in(email, password)
+            result = gazu.log_in(email, password)
         except Exception as e:
             self.connected = False
             return False, f"Login failed: {e}"
@@ -116,7 +117,32 @@ class KitsuManager:
         self.connected = True
         self.host = api_host
         self.email = email
-        return True, f"Connected to {api_host} as {email}"
+
+        # Resolve a friendly display name for the connected user.
+        self.user_name = email
+        try:
+            user = (result or {}).get("user") or {}
+            if not user:
+                user = gazu.client.get_current_user() or {}
+            full = user.get("full_name") or (
+                (user.get("first_name", "") + " " + user.get("last_name", "")).strip()
+            )
+            if full:
+                self.user_name = full
+        except Exception:
+            pass
+
+        return True, f"Connected to {api_host} as {self.user_name}"
+
+    def disconnect(self):
+        """Log out and clear connection state."""
+        try:
+            import gazu
+            gazu.log_out()
+        except Exception:
+            pass
+        self.connected = False
+        self.user_name = ""
 
     def list_projects(self):
         """Return Kitsu project dicts. Open projects first, falling back to all."""
@@ -244,3 +270,28 @@ class KitsuManager:
 
         registry.save()
         return summary
+
+    def import_all_projects(self, hub, root_dir, current_user="", progress=None):
+        """Sync every Kitsu project into the local hub (one-way: Kitsu -> pipeline).
+        Returns an aggregate summary."""
+        projects = self.list_projects()
+        totals = {
+            "ok": True, "projects": 0, "assets": 0, "shots": 0,
+            "tasks": 0, "skipped": 0, "names": [],
+        }
+        n = len(projects)
+        for i, p in enumerate(projects):
+            if progress:
+                try:
+                    progress(p.get("name", ""), i + 1, n)
+                except Exception:
+                    pass
+            s = self.import_project(p, hub, root_dir, current_user=current_user)
+            if s.get("ok"):
+                totals["projects"] += 1
+                totals["assets"] += s.get("assets", 0)
+                totals["shots"] += s.get("shots", 0)
+                totals["tasks"] += s.get("tasks", 0)
+                totals["skipped"] += s.get("skipped", 0)
+                totals["names"].append(s.get("project", ""))
+        return totals
