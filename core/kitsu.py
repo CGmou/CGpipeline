@@ -190,11 +190,24 @@ class KitsuManager:
                 kproj = None
         if not kproj:
             return True, "Already absent from Kitsu."
-        try:
-            gazu.project.remove_project(kproj, force=True)
-            return True, "Removed from Kitsu."
-        except Exception as e:
-            return False, f"Could not remove from Kitsu: {e}"
+
+        pid = kproj["id"]
+        # Delete via the raw API. gazu.project.remove_project(force=True) is buggy in
+        # some versions (passes `force` as the request params), so try the raw client
+        # delete first and fall back.
+        attempts = [
+            lambda: gazu.client.delete("data/projects/%s" % pid, {"force": "true"}),
+            lambda: gazu.client.delete("data/projects/%s?force=true" % pid),
+            lambda: gazu.project.remove_project(kproj, force=True),
+        ]
+        last_err = None
+        for attempt in attempts:
+            try:
+                attempt()
+                return True, "Removed from Kitsu."
+            except Exception as e:
+                last_err = e
+        return False, f"Could not remove from Kitsu: {last_err}"
 
     def _download_project_avatar(self, kproj, dest):
         import gazu
