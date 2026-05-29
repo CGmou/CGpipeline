@@ -54,13 +54,14 @@ CGP_TO_KITSU_TASK_TYPE = {
 }
 
 # Kitsu task status name/short-name (lowercased) -> CGPipeline status.
+# CGPipeline now uses the same Kitsu-aligned vocabulary, so this is mostly 1:1.
 STATUS_MAP = {
-    "todo": "Ready", "ready to start": "Ready", "ready": "Ready",
-    "wip": "In Progress", "work in progress": "In Progress", "in progress": "In Progress",
-    "wfa": "Pending Review", "waiting for approval": "Pending Review",
-    "pending review": "Pending Review", "pending": "Pending Review",
-    "done": "Approved", "approved": "Approved", "final": "Approved", "ok": "Approved",
-    "retake": "In Progress", "rejected": "In Progress",
+    "todo": "Todo", "ready to start": "Todo", "ready": "Todo",
+    "wip": "Work In Progress", "work in progress": "Work In Progress", "in progress": "Work In Progress",
+    "wfa": "Waiting For Approval", "waiting for approval": "Waiting For Approval",
+    "pending review": "Waiting For Approval", "pending": "Waiting For Approval",
+    "done": "Done", "approved": "Done", "final": "Done", "ok": "Done",
+    "retake": "Retake", "rejected": "Retake",
 }
 
 
@@ -78,7 +79,7 @@ def _map_status(*names):
         hit = STATUS_MAP.get((n or "").strip().lower())
         if hit:
             return hit
-    return "Ready"
+    return "Todo"
 
 
 def _normalize_host(host):
@@ -168,6 +169,60 @@ class KitsuManager:
             return self.connect(host, email, pw)
         return False, "Not connected to Kitsu. Open Kitsu → Production Tracker and connect first."
 
+    def remove_project_from_kitsu(self, local_project):
+        """Delete the project on the Kitsu server. Returns (ok, message). Used by
+        'Unload from Kitsu' so the project no longer exists on Kitsu."""
+        import gazu
+        if not self.connected:
+            return False, "Not connected to Kitsu."
+        kid = local_project.get("kitsu_id") or \
+            (local_project.get("kitsu_unlinked") or {}).get("kitsu_id")
+        kproj = None
+        if kid:
+            try:
+                kproj = gazu.project.get_project(kid)
+            except Exception:
+                kproj = None
+        if not kproj and local_project.get("name"):
+            try:
+                kproj = gazu.project.get_project_by_name(local_project["name"])
+            except Exception:
+                kproj = None
+        if not kproj:
+            return True, "Already absent from Kitsu."
+        try:
+            gazu.project.remove_project(kproj, force=True)
+            return True, "Removed from Kitsu."
+        except Exception as e:
+            return False, f"Could not remove from Kitsu: {e}"
+
+    def _download_project_avatar(self, kproj, dest):
+        import gazu
+        if not kproj.get("has_avatar"):
+            return None
+        try:
+            gazu.client.download_file(f"pictures/thumbnails/projects/{kproj['id']}.png", dest)
+            return dest if os.path.exists(dest) and os.path.getsize(dest) > 0 else None
+        except Exception:
+            return None
+
+    def _download_entity_thumb(self, entity, dest):
+        import gazu
+        pfid = entity.get("preview_file_id")
+        if not pfid:
+            return None
+        try:
+            gazu.files.download_preview_file_thumbnail(pfid, dest)
+            if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                return dest
+        except Exception:
+            pass
+        try:
+            gazu.client.download_file(f"pictures/thumbnails/preview-files/{pfid}.png", dest)
+            return dest if os.path.exists(dest) and os.path.getsize(dest) > 0 else None
+        except Exception:
+            return None
+
     def list_projects(self):
         """Return Kitsu project dicts. Open projects first, falling back to all."""
         import gazu
@@ -224,6 +279,19 @@ class KitsuManager:
         if current_user:
             registry.current_user = current_user
 
+        # Thumbnails: pull the project avatar + per-entity previews from Kitsu.
+        thumbs_dir = os.path.join(project["path"], ".thumbnails")
+        try:
+            os.makedirs(thumbs_dir, exist_ok=True)
+            pthumb = self._download_project_avatar(
+                kitsu_project, os.path.join(thumbs_dir, "_project.png")
+            )
+            if pthumb:
+                hub.update_project(project["id"], thumbnail=pthumb)
+                project["thumbnail"] = pthumb
+        except Exception:
+            pass
+
         summary = {
             "ok": True, "project": name, "path": project["path"],
             "assets": 0, "shots": 0, "tasks": 0, "skipped": 0,
@@ -239,7 +307,7 @@ class KitsuManager:
         except Exception:
             ts_map = {}
 
-        def import_tasks(entity, entity_name, category, sub_category, frame_in=None, frame_out=None):
+        def import_tasks(entity, entity_name, category, sub_category, frame_in=None, frame_out=None, thumbnail=""):
             try:
                 if category == "Assets":
                     tasks = gazu.task.all_tasks_for_asset(entity)
@@ -258,7 +326,7 @@ class KitsuManager:
                     tk.get("task_status_name"),
                     ts_map.get(tk.get("task_status_id")),
                 )
-                created = registry.add_task(entity_name, category, sub_category, ctype)
+                created = registry.add_task(entity_name, category, sub_category, ctype, thumbnail=thumbnail or "")
                 if created is None:
                     continue  # already exists
                 updates = {"status": status}
@@ -280,7 +348,8 @@ class KitsuManager:
             aname = a.get("name", "Asset")
             report(f"Asset: {aname}", i + 1, len(assets))
             sub = _map_asset_type(a.get("asset_type_name") or atypes.get(a.get("entity_type_id")))
-            import_tasks(a, aname, "Assets", sub)
+            thumb = self._download_entity_thumb(a, os.path.join(thumbs_dir, f"asset_{aname}.png")) or ""
+            import_tasks(a, aname, "Assets", sub, thumbnail=thumb)
             summary["assets"] += 1
 
         # --- Shots ---
@@ -300,7 +369,8 @@ class KitsuManager:
                     fin, fout = 1001, 1001 + int(s["nb_frames"]) - 1
             except (TypeError, ValueError):
                 fin = fout = None
-            import_tasks(s, sname, "Shots", "", frame_in=fin, frame_out=fout)
+            thumb = self._download_entity_thumb(s, os.path.join(thumbs_dir, f"shot_{sname}.png")) or ""
+            import_tasks(s, sname, "Shots", "", frame_in=fin, frame_out=fout, thumbnail=thumb)
             summary["shots"] += 1
 
         registry.save()

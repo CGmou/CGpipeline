@@ -300,17 +300,45 @@ class ProjectHubView(QWidget):
         self.refresh()
 
     def on_unload_from_kitsu(self, project_data):
+        from core.kitsu import KitsuManager
+        if not KitsuManager.available():
+            QMessageBox.warning(self, "Kitsu", "The 'gazu' package is not installed.\nRun: pip install gazu")
+            return
+
+        ok, msg = self.kitsu.ensure_connected(self.auth)
+        if not ok:
+            QMessageBox.information(self, "Connect to Kitsu", msg)
+            return
+
         reply = QMessageBox.question(
             self, "Unload from Kitsu",
-            f"Unlink '{project_data['name']}' from Kitsu?\n\n"
-            "The project stays here as a local project and its Kitsu link info is "
-            "saved, so you can re-upload it to the same Kitsu project later.\n\n"
-            "Nothing is removed from the Kitsu server or your drive.",
+            f"Remove '{project_data['name']}' from Kitsu?\n\n"
+            f"This DELETES the project on the Kitsu server ({self.kitsu.host}).\n"
+            "The project stays here as a local project (your files and tasks are "
+            "kept), and you can re-upload it to Kitsu later.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok, msg = self.kitsu.remove_project_from_kitsu(project_data)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Kitsu", f"Failed to remove from Kitsu:\n{e}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not ok:
+            QMessageBox.warning(self, "Kitsu", msg)
+            return
+
+        # Removed on the server -> now make it local-only (link info preserved).
         self.hub.unlink_kitsu(project_data["id"])
+        QMessageBox.information(self, "Unloaded from Kitsu",
+                               f"'{project_data['name']}' was removed from Kitsu and is now a local project.")
         self.refresh()
 
     def on_delete_project(self, project_data):
