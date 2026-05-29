@@ -11,10 +11,11 @@ class TaskCard(QFrame):
     continue_work_requested = Signal(dict)
     modify_requested = Signal(str)
 
-    def __init__(self, task_data, is_admin=False):
+    def __init__(self, task_data, is_admin=False, show_thumbs=True):
         super().__init__()
         self.task_data = task_data
         self.is_admin = is_admin
+        self.show_thumbs = show_thumbs
         self.setup_ui()
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
@@ -63,18 +64,19 @@ class TaskCard(QFrame):
         self.title_label.setWordWrap(True)
         layout.addWidget(self.title_label)
 
-        self.thumb_label = QLabel()
-        self.thumb_label.setFixedSize(220, 110)
-        self.thumb_label.setObjectName("Thumbnail")
-        self.thumb_label.setAlignment(Qt.AlignCenter)
+        if self.show_thumbs:
+            self.thumb_label = QLabel()
+            self.thumb_label.setFixedSize(220, 110)
+            self.thumb_label.setObjectName("Thumbnail")
+            self.thumb_label.setAlignment(Qt.AlignCenter)
 
-        thumb_path = self.task_data.get("thumbnail", "")
-        if thumb_path and os.path.exists(thumb_path):
-            pix = QPixmap(thumb_path).scaled(220, 110, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            self.thumb_label.setPixmap(pix)
-        else:
-            self.thumb_label.setText("No Thumbnail")
-        layout.addWidget(self.thumb_label)
+            thumb_path = self.task_data.get("thumbnail", "")
+            if thumb_path and os.path.exists(thumb_path):
+                pix = QPixmap(thumb_path).scaled(220, 110, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                self.thumb_label.setPixmap(pix)
+            else:
+                self.thumb_label.setText("No Thumbnail")
+            layout.addWidget(self.thumb_label)
 
         self.task_list_container = QWidget()
         task_list_layout = QVBoxLayout(self.task_list_container)

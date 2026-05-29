@@ -65,7 +65,7 @@ class WorkspaceView(QWidget):
 
     def refresh_all(self):
         is_admin = self.auth.is_admin()
-        self.dashboard.refresh(is_admin=is_admin)
+        self.dashboard.refresh(is_admin=is_admin, show_thumbs=self.show_thumbs)
         self.project_sheet.refresh(is_admin=is_admin)
 
     def switch_view(self, view):
