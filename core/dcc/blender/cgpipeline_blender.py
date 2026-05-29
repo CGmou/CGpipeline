@@ -172,6 +172,68 @@ def _find_view3d_context():
     return None, None, None
 
 
+def _gpu_viewport_capture(filepath):
+    """Capture the active 3D viewport with a GPU offscreen and save a PNG via an
+    image datablock. Bypasses the render output format entirely, so it works even
+    when the scene is locked to multilayer EXR. Returns (path_or_None, message)."""
+    try:
+        import gpu
+        import numpy as np
+    except Exception as e:
+        return None, f"GPU/numpy unavailable: {e}"
+
+    area, region, space = _find_view3d_context()
+    rv3d = getattr(space, "region_3d", None) if space else None
+    if not (area and region and rv3d):
+        return None, "No 3D viewport available to capture."
+
+    scene = bpy.context.scene
+    view_layer = bpy.context.view_layer
+    vw, vh = max(1, region.width), max(1, region.height)
+    width = 640
+    height = max(1, int(round(width * vh / float(vw))))
+
+    try:
+        offscreen = gpu.types.GPUOffScreen(width, height)
+    except Exception as e:
+        return None, f"Could not create offscreen buffer: {e}"
+
+    buffer = None
+    try:
+        view_matrix = rv3d.view_matrix
+        projection_matrix = rv3d.window_matrix
+        # Bind first, clear, draw, then read from the bound framebuffer. Reading the
+        # texture without binding returns uninitialised memory (the earlier "noise").
+        with offscreen.bind():
+            fb = gpu.state.active_framebuffer_get()
+            fb.clear(color=(0.08, 0.08, 0.08, 1.0))
+            try:
+                offscreen.draw_view3d(scene, view_layer, space, region,
+                                      view_matrix, projection_matrix, do_color_management=True)
+            except TypeError:
+                offscreen.draw_view3d(scene, view_layer, space, region,
+                                      view_matrix, projection_matrix)
+            buffer = fb.read_color(0, 0, width, height, 4, 0, 'UBYTE')
+    except Exception as e:
+        offscreen.free()
+        return None, f"Offscreen draw failed: {e}"
+    offscreen.free()
+
+    try:
+        buffer.dimensions = width * height * 4
+        arr = np.array(buffer, dtype='float32') / 255.0
+        img = bpy.data.images.new("cgp_thumb_tmp", width, height, alpha=True)
+        img.pixels.foreach_set(arr)
+        img.file_format = 'PNG'
+        img.filepath_raw = filepath
+        img.save()
+        bpy.data.images.remove(img)
+    except Exception as e:
+        return None, f"Saving GPU thumbnail failed: {e}"
+
+    return (filepath, "ok") if os.path.exists(filepath) else (None, "GPU thumbnail not written.")
+
+
 def _opengl_capture(final_path, thumbs_dir, clean):
     """OpenGL-render the active viewport straight to PNG. The PNG format enum is
     locked to multilayer EXR when image_settings.views_format == 'MULTIVIEW'
@@ -275,11 +337,14 @@ def capture_task_thumbnail(props):
     clean = str(entity).replace(" ", "_")
     final_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
 
-    # OpenGL render captures the viewport reliably. (No GPU-offscreen fallback: it
-    # produced noise on some setups, which is worse than a clear error.)
-    thumb_path, err = _opengl_capture(final_path, thumbs_dir, clean)
+    # GPU offscreen is primary: it writes a normal PNG via an image datablock and
+    # never touches the render output format (which is locked to multilayer EXR here).
+    # OpenGL render is the fallback.
+    thumb_path, err = _gpu_viewport_capture(final_path)
     if not thumb_path:
-        return None, err or "Thumbnail capture failed."
+        thumb_path, err2 = _opengl_capture(final_path, thumbs_dir, clean)
+        if not thumb_path:
+            return None, err or err2 or "Thumbnail capture failed."
 
     # Update the registry so the dashboard card picks it up.
     try:
