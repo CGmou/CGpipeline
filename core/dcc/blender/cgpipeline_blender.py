@@ -238,7 +238,38 @@ def capture_task_thumbnail(props):
         return thumb_path, f"Thumbnail saved but registry update failed: {e}"
 
     print(f"CGPipeline: Thumbnail updated -> {thumb_path}")
+    # Best-effort: push the new thumbnail up to Kitsu (runs in system Python).
+    fire_kitsu_sync(reg, entity, props.active_category, props.active_task_type, thumbnail=thumb_path)
     return thumb_path, "Thumbnail updated."
+
+
+def _find_system_python():
+    if os.name == 'nt':
+        return shutil.which("pythonw") or shutil.which("python") or "python"
+    return shutil.which("python3") or shutil.which("python") or "python3"
+
+
+def fire_kitsu_sync(reg, entity, category, task_type, status=None, thumbnail=None):
+    """Fire-and-forget: push a task's status/thumbnail to Kitsu via the system
+    Python (which has gazu). Never blocks or raises into Blender."""
+    if not reg or not entity or not task_type:
+        return
+    script = os.path.normpath(os.path.join(STANDALONE_PATH, "core", "kitsu_sync.py"))
+    if not os.path.exists(script):
+        return
+    try:
+        cmd = [_find_system_python(), script,
+               "--registry", reg, "--entity", str(entity),
+               "--category", category or "Assets", "--task-type", task_type]
+        if status:
+            cmd += ["--status", status]
+        if thumbnail:
+            cmd += ["--thumbnail", thumbnail]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        subprocess.Popen(cmd, creationflags=creationflags)
+        print("CGPipeline: Kitsu sync dispatched.")
+    except Exception as e:
+        print(f"CGPipeline: Could not dispatch Kitsu sync: {e}")
 
 # --- PROPERTY GROUPS ---
 class CGP_ObjectItem(bpy.types.PropertyGroup):
@@ -565,6 +596,9 @@ class CGP_OT_UpdateStatus(bpy.types.Operator):
             for tk in data.get('tasks', []):
                 if tk['id'] == tid: tk['status'] = props.status_enum; break
             with open(reg, 'w') as f: json.dump(data, f, indent=4)
+            # Best-effort: push the status change up to Kitsu.
+            fire_kitsu_sync(reg, props.active_entity, props.active_category,
+                            props.active_task_type, status=props.status_enum)
             self.report({'INFO'}, f"Status set to: {props.status_enum}"); return {'FINISHED'}
         except: return {'CANCELLED'}
 
