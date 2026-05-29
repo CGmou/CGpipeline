@@ -126,58 +126,104 @@ def find_matching_object_path(object_name_full, cache_db):
     return None
 
 
-def capture_task_thumbnail(props):
-    """Render the active 3D viewport to a PNG and set it as the thumbnail for every
-    task of the current entity in the registry. Returns the thumbnail path or None."""
+def _resolve_task_context(props):
+    """Return (registry_path, entity) for the current task. Falls back to deriving
+    them from the open .blend file path when props/env aren't populated (e.g. the
+    file was opened directly rather than via the Dashboard)."""
     reg = props.active_reg_path or os.environ.get('CGP_REGISTRY_PATH', '')
     entity = props.active_entity or os.environ.get('CGP_ENTITY_NAME', '')
+    if reg and entity and os.path.exists(reg):
+        return reg, entity
+
+    blend = bpy.data.filepath
+    if blend:
+        if not reg or not os.path.exists(reg):
+            cur = os.path.dirname(blend)
+            for _ in range(12):
+                cand = os.path.join(cur, 'registry.json')
+                if os.path.exists(cand):
+                    reg = cand
+                    break
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+        if not entity:
+            parts = os.path.normpath(blend).replace('\\', '/').split('/')
+            if 'Assets' in parts:
+                i = parts.index('Assets')
+                if len(parts) > i + 2:
+                    entity = parts[i + 2]
+            elif 'Shots' in parts:
+                i = parts.index('Shots')
+                if len(parts) > i + 1:
+                    entity = parts[i + 1]
+    return reg, entity
+
+
+def _find_view3d_context():
+    """Return (area, region, space) for a 3D viewport, or (None, None, None)."""
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+                if region:
+                    return area, region, area.spaces.active
+    return None, None, None
+
+
+def capture_task_thumbnail(props):
+    """Render the active 3D viewport to a PNG and set it as the thumbnail for every
+    task of the current entity in the registry. Returns (path_or_None, message)."""
+    reg, entity = _resolve_task_context(props)
     if not reg or not os.path.exists(reg) or not entity:
-        print("CGPipeline: No task context for thumbnail.")
-        return None
+        return None, "No task context found. Open the task via the Dashboard, or save the file inside a CGPipeline project."
 
     project_root = os.path.dirname(reg)
     thumbs_dir = os.path.join(project_root, ".thumbnails")
     try:
         os.makedirs(thumbs_dir, exist_ok=True)
     except Exception as e:
-        print(f"CGPipeline: Could not create thumbnails dir: {e}")
-        return None
+        return None, f"Could not create thumbnails folder: {e}"
     clean = str(entity).replace(" ", "_")
-    thumb_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
+    final_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
 
     scene = bpy.context.scene
     rs = scene.render
     saved = (rs.filepath, rs.resolution_x, rs.resolution_y, rs.resolution_percentage,
              rs.image_settings.file_format)
+    out_path = None
     try:
         rs.image_settings.file_format = 'PNG'
         rs.resolution_x, rs.resolution_y, rs.resolution_percentage = 512, 288, 100
-        rs.filepath = thumb_path
-        # Render what the artist sees in the viewport (not the camera).
-        try:
-            bpy.ops.render.opengl(write_still=True, view_context=True)
-        except Exception:
+        rs.filepath = os.path.join(thumbs_dir, clean + "_")
+        out_path = rs.frame_path(frame=scene.frame_current)
+
+        area, region, space = _find_view3d_context()
+        if area and region:
+            with bpy.context.temp_override(area=area, region=region, space_data=space):
+                bpy.ops.render.opengl(write_still=True, view_context=True)
+        else:
+            # No viewport available — fall back to a camera-based OpenGL render.
             bpy.ops.render.opengl(write_still=True)
     except Exception as e:
-        print(f"CGPipeline: Thumbnail render failed: {e}")
-        return None
+        return None, f"Viewport render failed: {e}"
     finally:
         (rs.filepath, rs.resolution_x, rs.resolution_y, rs.resolution_percentage,
          rs.image_settings.file_format) = saved
 
-    # Blender appends the frame number/extension; resolve the actual written file.
-    if not os.path.exists(thumb_path):
-        alt = thumb_path[:-4] + f"{scene.frame_current:04d}.png"
-        if os.path.exists(alt):
-            try:
-                if os.path.exists(thumb_path):
-                    os.remove(thumb_path)
-                os.rename(alt, thumb_path)
-            except Exception:
-                thumb_path = alt
-    if not os.path.exists(thumb_path):
-        print("CGPipeline: Thumbnail file was not written.")
-        return None
+    if not out_path or not os.path.exists(out_path):
+        return None, "Render produced no image."
+
+    # Normalise to a stable filename (drop the frame-number suffix).
+    try:
+        if os.path.normpath(out_path) != final_path:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            shutil.move(out_path, final_path)
+        thumb_path = final_path
+    except Exception:
+        thumb_path = out_path
 
     # Update the registry so the dashboard card picks it up.
     try:
@@ -189,10 +235,10 @@ def capture_task_thumbnail(props):
         with open(reg, 'w') as f:
             json.dump(data, f, indent=4)
     except Exception as e:
-        print(f"CGPipeline: Could not update registry thumbnail: {e}")
+        return thumb_path, f"Thumbnail saved but registry update failed: {e}"
 
     print(f"CGPipeline: Thumbnail updated -> {thumb_path}")
-    return thumb_path
+    return thumb_path, "Thumbnail updated."
 
 # --- PROPERTY GROUPS ---
 class CGP_ObjectItem(bpy.types.PropertyGroup):
@@ -695,7 +741,8 @@ class CGP_OT_PublishAction(bpy.types.Operator):
             # Auto-snapshot a thumbnail for the task after a successful publish.
             if getattr(props, 'auto_thumbnail', False):
                 try:
-                    capture_task_thumbnail(props)
+                    _, tmsg = capture_task_thumbnail(props)
+                    print(f"CGPipeline: Auto thumbnail: {tmsg}")
                 except Exception as te:
                     print(f"CGPipeline: Auto thumbnail failed: {te}")
 
@@ -712,11 +759,11 @@ class CGP_OT_CaptureThumbnail(bpy.types.Operator):
     bl_idname = 'cgp.capture_thumbnail'; bl_label = 'Snapshot Thumbnail'
     bl_description = 'Capture the current viewport as the thumbnail for this task'
     def execute(self, context):
-        path = capture_task_thumbnail(context.window_manager.cgp_props)
+        path, msg = capture_task_thumbnail(context.window_manager.cgp_props)
         if path:
-            self.report({'INFO'}, 'Thumbnail updated.')
+            self.report({'INFO'}, msg)
             return {'FINISHED'}
-        self.report({'WARNING'}, 'Could not capture thumbnail (open via Dashboard?).')
+        self.report({'WARNING'}, msg)
         return {'CANCELLED'}
 
 # --- OPERATORS (ASSEMBLY) ---
