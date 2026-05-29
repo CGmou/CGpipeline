@@ -234,15 +234,30 @@ def _gpu_viewport_capture(filepath):
 
 
 def _opengl_capture(final_path, thumbs_dir, clean):
-    """Fallback: OpenGL-render the viewport in the scene's current output format,
-    then convert to PNG if needed (without touching image_settings.file_format,
-    which can reject PNG when locked to multilayer EXR)."""
+    """OpenGL-render the active viewport straight to PNG. The PNG format enum is
+    locked to multilayer EXR when image_settings.views_format == 'MULTIVIEW'
+    (Multi-View), so switch views_format to 'INDIVIDUAL' first, then restore."""
     scene = bpy.context.scene
     rs = scene.render
+    imf = rs.image_settings
     saved_filepath = rs.filepath
     saved_res = (rs.resolution_x, rs.resolution_y, rs.resolution_percentage)
+    saved_fmt = imf.file_format
+    saved_views = getattr(imf, "views_format", None)
+    saved_mv = rs.use_multiview
     out_path = None
     try:
+        try:
+            rs.use_multiview = False
+        except Exception:
+            pass
+        # This is the actual unlock for the PNG-enum error.
+        if saved_views is not None:
+            try:
+                imf.views_format = 'INDIVIDUAL'
+            except Exception:
+                pass
+        imf.file_format = 'PNG'
         rs.resolution_x, rs.resolution_y, rs.resolution_percentage = 640, 360, 100
         rs.filepath = os.path.join(thumbs_dir, clean + "_")
         out_path = rs.frame_path(frame=scene.frame_current)
@@ -257,41 +272,30 @@ def _opengl_capture(final_path, thumbs_dir, clean):
     finally:
         rs.filepath = saved_filepath
         rs.resolution_x, rs.resolution_y, rs.resolution_percentage = saved_res
-
-    if not out_path or not os.path.exists(out_path):
-        return None, "Render produced no image."
-
-    if os.path.splitext(out_path)[1].lower() == ".png":
         try:
-            if os.path.normpath(out_path) != final_path:
-                if os.path.exists(final_path):
-                    os.remove(final_path)
-                shutil.move(out_path, final_path)
-            return final_path, "ok"
+            imf.file_format = saved_fmt
         except Exception:
-            return out_path, "ok"
-
-    # Convert (e.g. EXR) -> PNG via a temporary image datablock.
-    img = None
-    try:
-        img = bpy.data.images.load(out_path, check_existing=False)
-        img.file_format = 'PNG'
-        img.filepath_raw = final_path
-        img.save()
-        return final_path, "ok"
-    except Exception as e:
-        return None, f"Could not convert render to PNG: {e}"
-    finally:
-        if img is not None:
+            pass
+        if saved_views is not None:
             try:
-                bpy.data.images.remove(img)
+                imf.views_format = saved_views
             except Exception:
                 pass
         try:
-            if os.path.exists(out_path) and os.path.normpath(out_path) != os.path.normpath(final_path):
-                os.remove(out_path)
+            rs.use_multiview = saved_mv
         except Exception:
             pass
+
+    if not out_path or not os.path.exists(out_path):
+        return None, "Render produced no image."
+    try:
+        if os.path.normpath(out_path) != final_path:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            shutil.move(out_path, final_path)
+        return final_path, "ok"
+    except Exception:
+        return out_path, "ok"
 
 
 def capture_task_thumbnail(props):
@@ -310,11 +314,11 @@ def capture_task_thumbnail(props):
     clean = str(entity).replace(" ", "_")
     final_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
 
-    # Capture via the GPU (robust: never touches the render output format, which can
-    # be locked to multilayer EXR). Fall back to an OpenGL render if GPU capture fails.
-    thumb_path, err = _gpu_viewport_capture(final_path)
+    # OpenGL render is primary (it reliably captures the viewport contents). GPU
+    # offscreen is only a last resort, since some setups read uninitialised pixels.
+    thumb_path, err = _opengl_capture(final_path, thumbs_dir, clean)
     if not thumb_path:
-        thumb_path, err2 = _opengl_capture(final_path, thumbs_dir, clean)
+        thumb_path, err2 = _gpu_viewport_capture(final_path)
         if not thumb_path:
             return None, err or err2 or "Thumbnail capture failed."
 
