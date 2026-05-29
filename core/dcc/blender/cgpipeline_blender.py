@@ -172,6 +172,128 @@ def _find_view3d_context():
     return None, None, None
 
 
+def _gpu_viewport_capture(filepath):
+    """Capture the active 3D viewport with a GPU offscreen and save it as PNG.
+    Avoids the render pipeline entirely, so it's immune to the scene's output
+    format being locked to multilayer EXR. Returns (path_or_None, message)."""
+    try:
+        import gpu
+    except Exception as e:
+        return None, f"GPU module unavailable: {e}"
+    area, region, space = _find_view3d_context()
+    rv3d = getattr(space, "region_3d", None) if space else None
+    if not (area and region and rv3d):
+        return None, "No 3D viewport available to capture."
+
+    scene = bpy.context.scene
+    view_layer = bpy.context.view_layer
+    vw, vh = max(1, region.width), max(1, region.height)
+    width = 640
+    height = max(1, int(round(width * vh / float(vw))))
+
+    try:
+        offscreen = gpu.types.GPUOffScreen(width, height)
+    except Exception as e:
+        return None, f"Could not create offscreen buffer: {e}"
+    try:
+        view_matrix = rv3d.view_matrix
+        projection_matrix = rv3d.window_matrix
+        try:
+            offscreen.draw_view3d(scene, view_layer, space, region,
+                                  view_matrix, projection_matrix, do_color_management=True)
+        except TypeError:
+            offscreen.draw_view3d(scene, view_layer, space, region,
+                                  view_matrix, projection_matrix)
+        buf = offscreen.texture_color.read()
+    except Exception as e:
+        offscreen.free()
+        return None, f"Offscreen draw failed: {e}"
+    offscreen.free()
+
+    img = bpy.data.images.new("cgp_thumb_tmp", width, height, alpha=True)
+    try:
+        import numpy as np
+        arr = np.array(buf, dtype='float32')
+        if arr.size and arr.max() > 1.0:   # RGBA8 buffer -> 0..255
+            arr = arr / 255.0
+        img.pixels.foreach_set(arr.ravel())
+        img.file_format = 'PNG'
+        img.filepath_raw = filepath
+        img.save()
+    except Exception as e:
+        try:
+            bpy.data.images.remove(img)
+        except Exception:
+            pass
+        return None, f"Saving GPU thumbnail failed: {e}"
+    try:
+        bpy.data.images.remove(img)
+    except Exception:
+        pass
+    return (filepath, "ok") if os.path.exists(filepath) else (None, "GPU thumbnail not written.")
+
+
+def _opengl_capture(final_path, thumbs_dir, clean):
+    """Fallback: OpenGL-render the viewport in the scene's current output format,
+    then convert to PNG if needed (without touching image_settings.file_format,
+    which can reject PNG when locked to multilayer EXR)."""
+    scene = bpy.context.scene
+    rs = scene.render
+    saved_filepath = rs.filepath
+    saved_res = (rs.resolution_x, rs.resolution_y, rs.resolution_percentage)
+    out_path = None
+    try:
+        rs.resolution_x, rs.resolution_y, rs.resolution_percentage = 640, 360, 100
+        rs.filepath = os.path.join(thumbs_dir, clean + "_")
+        out_path = rs.frame_path(frame=scene.frame_current)
+        area, region, space = _find_view3d_context()
+        if area and region:
+            with bpy.context.temp_override(area=area, region=region, space_data=space):
+                bpy.ops.render.opengl(write_still=True, view_context=True)
+        else:
+            bpy.ops.render.opengl(write_still=True)
+    except Exception as e:
+        return None, f"Viewport render failed: {e}"
+    finally:
+        rs.filepath = saved_filepath
+        rs.resolution_x, rs.resolution_y, rs.resolution_percentage = saved_res
+
+    if not out_path or not os.path.exists(out_path):
+        return None, "Render produced no image."
+
+    if os.path.splitext(out_path)[1].lower() == ".png":
+        try:
+            if os.path.normpath(out_path) != final_path:
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                shutil.move(out_path, final_path)
+            return final_path, "ok"
+        except Exception:
+            return out_path, "ok"
+
+    # Convert (e.g. EXR) -> PNG via a temporary image datablock.
+    img = None
+    try:
+        img = bpy.data.images.load(out_path, check_existing=False)
+        img.file_format = 'PNG'
+        img.filepath_raw = final_path
+        img.save()
+        return final_path, "ok"
+    except Exception as e:
+        return None, f"Could not convert render to PNG: {e}"
+    finally:
+        if img is not None:
+            try:
+                bpy.data.images.remove(img)
+            except Exception:
+                pass
+        try:
+            if os.path.exists(out_path) and os.path.normpath(out_path) != os.path.normpath(final_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+
+
 def capture_task_thumbnail(props):
     """Render the active 3D viewport to a PNG and set it as the thumbnail for every
     task of the current entity in the registry. Returns (path_or_None, message)."""
@@ -188,60 +310,13 @@ def capture_task_thumbnail(props):
     clean = str(entity).replace(" ", "_")
     final_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
 
-    scene = bpy.context.scene
-    rs = scene.render
-    saved_filepath = rs.filepath
-    saved_res = (rs.resolution_x, rs.resolution_y, rs.resolution_percentage)
-    saved_fmt = rs.image_settings.file_format
-    saved_mv = rs.use_multiview
-    out_path = None
-    try:
-        # Multi-View locks the output to OPEN_EXR_MULTILAYER and blocks PNG; turn it
-        # off for the snapshot so we can write a normal PNG the dashboard can read.
-        try:
-            rs.use_multiview = False
-        except Exception:
-            pass
-        rs.image_settings.file_format = 'PNG'
-        rs.resolution_x, rs.resolution_y, rs.resolution_percentage = 512, 288, 100
-        rs.filepath = os.path.join(thumbs_dir, clean + "_")
-        out_path = rs.frame_path(frame=scene.frame_current)
-
-        area, region, space = _find_view3d_context()
-        if area and region:
-            with bpy.context.temp_override(area=area, region=region, space_data=space):
-                bpy.ops.render.opengl(write_still=True, view_context=True)
-        else:
-            # No viewport available — fall back to a camera-based OpenGL render.
-            bpy.ops.render.opengl(write_still=True)
-    except Exception as e:
-        return None, f"Viewport render failed: {e}"
-    finally:
-        # Restore in a safe order: format/res first (while multiview is still off),
-        # then re-enable multiview last so the locked enum doesn't reject the format.
-        rs.filepath = saved_filepath
-        rs.resolution_x, rs.resolution_y, rs.resolution_percentage = saved_res
-        try:
-            rs.image_settings.file_format = saved_fmt
-        except Exception:
-            pass
-        try:
-            rs.use_multiview = saved_mv
-        except Exception:
-            pass
-
-    if not out_path or not os.path.exists(out_path):
-        return None, "Render produced no image."
-
-    # Normalise to a stable filename (drop the frame-number suffix).
-    try:
-        if os.path.normpath(out_path) != final_path:
-            if os.path.exists(final_path):
-                os.remove(final_path)
-            shutil.move(out_path, final_path)
-        thumb_path = final_path
-    except Exception:
-        thumb_path = out_path
+    # Capture via the GPU (robust: never touches the render output format, which can
+    # be locked to multilayer EXR). Fall back to an OpenGL render if GPU capture fails.
+    thumb_path, err = _gpu_viewport_capture(final_path)
+    if not thumb_path:
+        thumb_path, err2 = _opengl_capture(final_path, thumbs_dir, clean)
+        if not thumb_path:
+            return None, err or err2 or "Thumbnail capture failed."
 
     # Update the registry so the dashboard card picks it up.
     try:
