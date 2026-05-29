@@ -139,11 +139,31 @@ class CGPipelineApp(QMainWindow):
         if settings.get("remember") and settings.get("last_user") and settings.get("last_pass"):
             user = self.auth.login(settings["last_user"], settings["last_pass"], remember=True)
             if user:
-                self.show_hub()
+                self.enter_app()
             else:
                 self.show_login()
         else:
             self.show_login()
+
+    def enter_app(self):
+        """After login, go straight to the active project's workspace when launched
+        from a DCC (env carries CGP_REGISTRY_PATH); otherwise show the project hub."""
+        self.show_hub()
+        dcc_reg = os.environ.get("CGP_REGISTRY_PATH", "")
+        in_dcc = os.environ.get("CGP_IN_DCC", "")
+        if in_dcc and dcc_reg and os.path.exists(dcc_reg):
+            project_path = os.path.normpath(os.path.dirname(dcc_reg))
+            project = None
+            try:
+                for p in self.hub.projects:
+                    if os.path.normpath(p.get("path", "")) == project_path:
+                        project = p
+                        break
+            except Exception:
+                project = None
+            if not project:
+                project = {"path": project_path, "name": os.path.basename(project_path)}
+            self.on_project_selected(project)
 
     def closeEvent(self, event):
         if hasattr(self, 'lock_file') and os.path.exists(self.lock_file):
@@ -201,7 +221,7 @@ class CGPipelineApp(QMainWindow):
         self.stack.setCurrentWidget(self.login_view)
 
     def on_login_success(self, user_data):
-        self.show_hub()
+        self.enter_app()
 
     def show_hub(self):
         self.hub_view = ProjectHubView(self.hub, self.auth, kitsu=self.kitsu)
