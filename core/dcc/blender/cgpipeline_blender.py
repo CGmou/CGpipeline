@@ -190,10 +190,18 @@ def capture_task_thumbnail(props):
 
     scene = bpy.context.scene
     rs = scene.render
-    saved = (rs.filepath, rs.resolution_x, rs.resolution_y, rs.resolution_percentage,
-             rs.image_settings.file_format)
+    saved_filepath = rs.filepath
+    saved_res = (rs.resolution_x, rs.resolution_y, rs.resolution_percentage)
+    saved_fmt = rs.image_settings.file_format
+    saved_mv = rs.use_multiview
     out_path = None
     try:
+        # Multi-View locks the output to OPEN_EXR_MULTILAYER and blocks PNG; turn it
+        # off for the snapshot so we can write a normal PNG the dashboard can read.
+        try:
+            rs.use_multiview = False
+        except Exception:
+            pass
         rs.image_settings.file_format = 'PNG'
         rs.resolution_x, rs.resolution_y, rs.resolution_percentage = 512, 288, 100
         rs.filepath = os.path.join(thumbs_dir, clean + "_")
@@ -209,8 +217,18 @@ def capture_task_thumbnail(props):
     except Exception as e:
         return None, f"Viewport render failed: {e}"
     finally:
-        (rs.filepath, rs.resolution_x, rs.resolution_y, rs.resolution_percentage,
-         rs.image_settings.file_format) = saved
+        # Restore in a safe order: format/res first (while multiview is still off),
+        # then re-enable multiview last so the locked enum doesn't reject the format.
+        rs.filepath = saved_filepath
+        rs.resolution_x, rs.resolution_y, rs.resolution_percentage = saved_res
+        try:
+            rs.image_settings.file_format = saved_fmt
+        except Exception:
+            pass
+        try:
+            rs.use_multiview = saved_mv
+        except Exception:
+            pass
 
     if not out_path or not os.path.exists(out_path):
         return None, "Render produced no image."

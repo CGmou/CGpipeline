@@ -47,7 +47,7 @@ SUBCAT_TO_KITSU_ASSET_TYPE = {
     "Char": "Character", "Props": "Prop", "Sets": "Environment", "Vehicles": "Vehicle",
 }
 CGP_TO_KITSU_TASK_TYPE = {
-    "Model": "Modeling", "Texture": "Texture", "Lookdev": "Shading", "Rig": "Rigging",
+    "Model": "Modeling", "Texture": "Texture", "Lookdev": "Lookdev", "Rig": "Rigging",
     "Animation": "Animation", "Layout": "Layout", "Blocking": "Blocking",
     "Lighting": "Lighting", "Comp": "Compositing", "FX": "FX", "CFX": "CFX",
     "Assembly": "Assembly", "Setdress": "Set Dressing",
