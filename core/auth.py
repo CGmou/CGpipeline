@@ -74,12 +74,16 @@ class AuthManager:
 
     def load_settings(self):
         default_settings = {
-            "last_user": "", 
-            "last_pass": "", 
-            "remember": False, 
-            "project_root": "", 
+            "last_user": "",
+            "last_pass": "",
+            "remember": False,
+            "project_root": "",
             "dcc_paths_win": {"Maya": "", "Blender": "", "Houdini": ""},
-            "dcc_paths_mac": {"Maya": "", "Blender": "", "Houdini": ""}
+            "dcc_paths_mac": {"Maya": "", "Blender": "", "Houdini": ""},
+            "kitsu_host": "",
+            "kitsu_email": "",
+            "kitsu_pass": "",
+            "kitsu_remember": False,
         }
         
         if os.path.exists(self.settings_file):
@@ -139,6 +143,15 @@ class AuthManager:
             with open(self.settings_file, "w") as f:
                 json.dump(self.settings, f, indent=4)
         except: pass
+
+    def save(self):
+        """Persist the current settings dict as-is (used by feature dialogs that
+        write their own keys, e.g. Kitsu)."""
+        try:
+            with open(self.settings_file, "w") as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            print("Error saving settings: " + str(e))
 
     def is_admin(self):
         return self.current_user and self.current_user.get("role") == "admin"

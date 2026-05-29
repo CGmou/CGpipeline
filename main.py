@@ -156,12 +156,16 @@ class CGPipelineApp(QMainWindow):
             QMenu::item:selected { background-color: #0078D4; color: white; }
         """)
         settings_menu = menubar.addMenu("Settings")
-        
+
         root_action = settings_menu.addAction("Project Root")
         root_action.triggered.connect(self.on_open_root_settings)
-        
+
         paths_action = settings_menu.addAction("DCC Paths")
         paths_action.triggered.connect(self.on_open_dcc_settings)
+
+        kitsu_menu = menubar.addMenu("Kitsu")
+        kitsu_action = kitsu_menu.addAction("Production Tracker...")
+        kitsu_action.triggered.connect(self.on_open_kitsu)
 
     def on_open_root_settings(self):
         dialog = ProjectRootDialog(self.auth, self)
@@ -170,6 +174,21 @@ class CGPipelineApp(QMainWindow):
     def on_open_dcc_settings(self):
         dialog = DCCPathsDialog(self.auth, self)
         dialog.exec()
+
+    def on_open_kitsu(self):
+        # Imported lazily so the app starts even if gazu isn't installed.
+        from ui.kitsu_dialog import KitsuDialog
+        dialog = KitsuDialog(self.auth, self.hub, self)
+        dialog.imported.connect(self.on_kitsu_imported)
+        dialog.exec()
+
+    def on_kitsu_imported(self):
+        # Refresh the hub so newly imported projects appear immediately.
+        if hasattr(self, "hub_view"):
+            try:
+                self.hub_view.refresh()
+            except Exception:
+                pass
 
     def show_login(self):
         self.login_view = LoginView(self.auth)
