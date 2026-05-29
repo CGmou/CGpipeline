@@ -2,6 +2,7 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction
 from .task_card import TaskCard
+from core.constants import DEFAULT_STATUS
 
 class Dashboard(QWidget):
     modify_requested = Signal(str)
@@ -11,6 +12,7 @@ class Dashboard(QWidget):
     def __init__(self, registry):
         super().__init__()
         self.registry = registry
+        self.show_thumbs = True
         self.setup_ui()
 
     def setup_ui(self):
@@ -79,7 +81,9 @@ class Dashboard(QWidget):
         scroll.setWidget(container)
         main_layout.addWidget(scroll)
 
-    def refresh(self, is_admin=False):
+    def refresh(self, is_admin=False, show_thumbs=None):
+        if show_thumbs is not None:
+            self.show_thumbs = show_thumbs
         # Reload tasks from disk
         self.registry.load()
         
@@ -110,12 +114,12 @@ class Dashboard(QWidget):
 
             task_info = []
             for t in tasks:
-                task_info.append({"type": t["type"], "status": t.get("status", "Ready")})
+                task_info.append({"type": t["type"], "status": t.get("status", DEFAULT_STATUS)})
             display_data["combined_tasks"] = task_info
             display_data["all_task_objs"] = tasks
             display_data["current_user"] = current_username
 
-            card = TaskCard(display_data, is_admin=is_admin)
+            card = TaskCard(display_data, is_admin=is_admin, show_thumbs=self.show_thumbs)
             card.clicked.connect(self.on_task_clicked)
             card.start_work_requested.connect(self.start_work_requested.emit)
             card.continue_work_requested.connect(self.continue_work_requested.emit)

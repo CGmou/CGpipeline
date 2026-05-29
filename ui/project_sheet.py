@@ -1,5 +1,6 @@
 ﻿from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QLabel, QHeaderView, QPushButton, QInputDialog, QMessageBox
 from PySide6.QtCore import Qt
+from core.constants import TASK_STATUSES, DEFAULT_STATUS
 
 class ProjectSheet(QWidget):
     def __init__(self, registry):
@@ -160,12 +161,12 @@ class ProjectSheet(QWidget):
                             f_end = t.get("frame_end", "-")
                             f_range = str(f_start) + "-" + str(f_end) if f_start != "-" else "-"
                             
-                            date_val = t.get("updated_at", "-") if t.get("status") != "Ready" else "-"
+                            date_val = t.get("updated_at", "-") if t.get("status") != DEFAULT_STATUS else "-"
                             
                             t_item = QTreeWidgetItem(seq_item, [
                                 "   " + str(t.get("type")),
                                 "", 
-                                t.get("status", "Ready"),
+                                t.get("status", DEFAULT_STATUS),
                                 t.get("priority", "Normal"),
                                 t.get("assigned_to", "-"),
                                 f_range,
@@ -181,12 +182,12 @@ class ProjectSheet(QWidget):
                     entity_item.setForeground(0, Qt.white)
 
                     for t in data["tasks"]:
-                        date_val = t.get("updated_at", "-") if t.get("status") != "Ready" else "-"
-                        
+                        date_val = t.get("updated_at", "-") if t.get("status") != DEFAULT_STATUS else "-"
+
                         t_item = QTreeWidgetItem(entity_item, [
                             "   " + str(t.get("type")),
                             "",
-                            t.get("status", "Ready"),
+                            t.get("status", DEFAULT_STATUS),
                             t.get("priority", "Normal"),
                             t.get("assigned_to", "-"),
                             "-",
@@ -210,7 +211,7 @@ class ProjectSheet(QWidget):
         if not task: return
 
         if column == 2: # Status
-            options = ["Ready", "In Progress", "Pending Review", "Approved", "Omit"]
+            options = TASK_STATUSES
             current = item.text(column)
             val, ok = QInputDialog.getItem(self, "Quick Edit Status", "Select Status:", options, options.index(current) if current in options else 0, False)
             if ok:

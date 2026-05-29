@@ -8,6 +8,7 @@ from ui.new_task_dialog import NewTaskDialog
 from ui.modify_task_dialog import ModifyTaskDialog
 from core.utils import build_work_filename, get_latest_version
 from core.launcher import launch_dcc
+from core.constants import DEFAULT_STATUS
 import os
 
 class WorkspaceView(QWidget):
@@ -64,7 +65,7 @@ class WorkspaceView(QWidget):
 
     def refresh_all(self):
         is_admin = self.auth.is_admin()
-        self.dashboard.refresh(is_admin=is_admin)
+        self.dashboard.refresh(is_admin=is_admin, show_thumbs=self.show_thumbs)
         self.project_sheet.refresh(is_admin=is_admin)
 
     def switch_view(self, view):
@@ -161,8 +162,8 @@ class WorkspaceView(QWidget):
 
         success, err = launch_dcc(dcc_name, dcc_exe, task_obj, reg_path)
         if success:
-            if task_obj["status"] == "Ready": 
-                self.registry.update_task(task_obj["id"], status="In Progress")
+            if task_obj["status"] == DEFAULT_STATUS:
+                self.registry.update_task(task_obj["id"], status="Work In Progress")
             self.refresh_all()
         else: 
             QMessageBox.critical(self, "Launch Error", f"Failed to launch {dcc_name}:\n{err}")
@@ -221,7 +222,7 @@ class WorkspaceView(QWidget):
             return
         success, err = launch_dcc(dcc_name, dcc_exe, task_obj, reg_path)
         if success:
-            if task_obj["status"] == "Ready": self.registry.update_task(task_obj["id"], status="In Progress")
+            if task_obj["status"] == DEFAULT_STATUS: self.registry.update_task(task_obj["id"], status="Work In Progress")
             self.refresh_all()
             if dialog: dialog.accept()
         else: 

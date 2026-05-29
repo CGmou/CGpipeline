@@ -125,6 +125,273 @@ def find_matching_object_path(object_name_full, cache_db):
         if l.endswith(name): return paths[i]
     return None
 
+
+def _resolve_task_context(props):
+    """Return (registry_path, entity) for the current task. Falls back to deriving
+    them from the open .blend file path when props/env aren't populated (e.g. the
+    file was opened directly rather than via the Dashboard)."""
+    reg = props.active_reg_path or os.environ.get('CGP_REGISTRY_PATH', '')
+    entity = props.active_entity or os.environ.get('CGP_ENTITY_NAME', '')
+    if reg and entity and os.path.exists(reg):
+        return reg, entity
+
+    blend = bpy.data.filepath
+    if blend:
+        if not reg or not os.path.exists(reg):
+            cur = os.path.dirname(blend)
+            for _ in range(12):
+                cand = os.path.join(cur, 'registry.json')
+                if os.path.exists(cand):
+                    reg = cand
+                    break
+                parent = os.path.dirname(cur)
+                if parent == cur:
+                    break
+                cur = parent
+        if not entity:
+            parts = os.path.normpath(blend).replace('\\', '/').split('/')
+            if 'Assets' in parts:
+                i = parts.index('Assets')
+                if len(parts) > i + 2:
+                    entity = parts[i + 2]
+            elif 'Shots' in parts:
+                i = parts.index('Shots')
+                if len(parts) > i + 1:
+                    entity = parts[i + 1]
+    return reg, entity
+
+
+def _find_view3d_context():
+    """Return (area, region, space) for a 3D viewport, or (None, None, None)."""
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+                if region:
+                    return area, region, area.spaces.active
+    return None, None, None
+
+
+def _gpu_viewport_capture(filepath):
+    """Capture the active 3D viewport with a GPU offscreen and save a PNG via an
+    image datablock. Bypasses the render output format entirely, so it works even
+    when the scene is locked to multilayer EXR. Returns (path_or_None, message)."""
+    try:
+        import gpu
+        import numpy as np
+    except Exception as e:
+        return None, f"GPU/numpy unavailable: {e}"
+
+    area, region, space = _find_view3d_context()
+    rv3d = getattr(space, "region_3d", None) if space else None
+    if not (area and region and rv3d):
+        return None, "No 3D viewport available to capture."
+
+    scene = bpy.context.scene
+    view_layer = bpy.context.view_layer
+    vw, vh = max(1, region.width), max(1, region.height)
+    width = 640
+    height = max(1, int(round(width * vh / float(vw))))
+
+    try:
+        offscreen = gpu.types.GPUOffScreen(width, height)
+    except Exception as e:
+        return None, f"Could not create offscreen buffer: {e}"
+
+    buffer = None
+    try:
+        view_matrix = rv3d.view_matrix
+        projection_matrix = rv3d.window_matrix
+        # Bind first, clear, draw, then read from the bound framebuffer. Reading the
+        # texture without binding returns uninitialised memory (the earlier "noise").
+        with offscreen.bind():
+            fb = gpu.state.active_framebuffer_get()
+            fb.clear(color=(0.08, 0.08, 0.08, 1.0))
+            try:
+                offscreen.draw_view3d(scene, view_layer, space, region,
+                                      view_matrix, projection_matrix, do_color_management=True)
+            except TypeError:
+                offscreen.draw_view3d(scene, view_layer, space, region,
+                                      view_matrix, projection_matrix)
+            buffer = fb.read_color(0, 0, width, height, 4, 0, 'UBYTE')
+    except Exception as e:
+        offscreen.free()
+        return None, f"Offscreen draw failed: {e}"
+    offscreen.free()
+
+    try:
+        buffer.dimensions = width * height * 4
+        arr = np.array(buffer, dtype='float32') / 255.0
+        img = bpy.data.images.new("cgp_thumb_tmp", width, height, alpha=True)
+        img.pixels.foreach_set(arr)
+        img.file_format = 'PNG'
+        img.filepath_raw = filepath
+        img.save()
+        bpy.data.images.remove(img)
+    except Exception as e:
+        return None, f"Saving GPU thumbnail failed: {e}"
+
+    return (filepath, "ok") if os.path.exists(filepath) else (None, "GPU thumbnail not written.")
+
+
+def _opengl_capture(final_path, thumbs_dir, clean):
+    """OpenGL-render the active viewport straight to PNG. The PNG format enum is
+    locked to multilayer EXR when image_settings.views_format == 'MULTIVIEW'
+    (Multi-View), so switch views_format to 'INDIVIDUAL' first, then restore."""
+    scene = bpy.context.scene
+    rs = scene.render
+    imf = rs.image_settings
+    saved_filepath = rs.filepath
+    saved_res = (rs.resolution_x, rs.resolution_y, rs.resolution_percentage)
+    saved_fmt = imf.file_format
+    saved_views = getattr(imf, "views_format", None)
+    saved_mode = getattr(imf, "color_mode", None)
+    saved_depth = getattr(imf, "color_depth", None)
+    saved_mv = rs.use_multiview
+    out_path = None
+    try:
+        try:
+            rs.use_multiview = False
+        except Exception:
+            pass
+        # Unlock the PNG enum (views_format == MULTIVIEW forces multilayer EXR).
+        if saved_views is not None:
+            try:
+                imf.views_format = 'INDIVIDUAL'
+            except Exception:
+                pass
+        imf.file_format = 'PNG'
+        # Force a plain 8-bit RGBA PNG so the dashboard's Qt loader can read it
+        # (16-bit / unusual color modes can render as a "broken" image).
+        try:
+            imf.color_mode = 'RGBA'
+        except Exception:
+            pass
+        try:
+            imf.color_depth = '8'
+        except Exception:
+            pass
+        rs.resolution_x, rs.resolution_y, rs.resolution_percentage = 640, 360, 100
+        rs.filepath = os.path.join(thumbs_dir, clean + "_")
+        out_path = rs.frame_path(frame=scene.frame_current)
+        area, region, space = _find_view3d_context()
+        if area and region:
+            with bpy.context.temp_override(area=area, region=region, space_data=space):
+                bpy.ops.render.opengl(write_still=True, view_context=True)
+        else:
+            bpy.ops.render.opengl(write_still=True)
+    except Exception as e:
+        return None, f"Viewport render failed: {e}"
+    finally:
+        rs.filepath = saved_filepath
+        rs.resolution_x, rs.resolution_y, rs.resolution_percentage = saved_res
+        try:
+            imf.file_format = saved_fmt
+        except Exception:
+            pass
+        if saved_views is not None:
+            try:
+                imf.views_format = saved_views
+            except Exception:
+                pass
+        if saved_mode is not None:
+            try:
+                imf.color_mode = saved_mode
+            except Exception:
+                pass
+        if saved_depth is not None:
+            try:
+                imf.color_depth = saved_depth
+            except Exception:
+                pass
+        try:
+            rs.use_multiview = saved_mv
+        except Exception:
+            pass
+
+    if not out_path or not os.path.exists(out_path):
+        return None, "Render produced no image (OpenGL viewport render wrote nothing)."
+    try:
+        if os.path.normpath(out_path) != final_path:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            shutil.move(out_path, final_path)
+        return final_path, "ok"
+    except Exception:
+        return out_path, "ok"
+
+
+def capture_task_thumbnail(props):
+    """Render the active 3D viewport to a PNG and set it as the thumbnail for every
+    task of the current entity in the registry. Returns (path_or_None, message)."""
+    reg, entity = _resolve_task_context(props)
+    if not reg or not os.path.exists(reg) or not entity:
+        return None, "No task context found. Open the task via the Dashboard, or save the file inside a CGPipeline project."
+
+    project_root = os.path.dirname(reg)
+    thumbs_dir = os.path.join(project_root, ".thumbnails")
+    try:
+        os.makedirs(thumbs_dir, exist_ok=True)
+    except Exception as e:
+        return None, f"Could not create thumbnails folder: {e}"
+    clean = str(entity).replace(" ", "_")
+    final_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
+
+    # GPU offscreen is primary: it writes a normal PNG via an image datablock and
+    # never touches the render output format (which is locked to multilayer EXR here).
+    # OpenGL render is the fallback.
+    thumb_path, err = _gpu_viewport_capture(final_path)
+    if not thumb_path:
+        thumb_path, err2 = _opengl_capture(final_path, thumbs_dir, clean)
+        if not thumb_path:
+            return None, err or err2 or "Thumbnail capture failed."
+
+    # Update the registry so the dashboard card picks it up.
+    try:
+        with open(reg, 'r') as f:
+            data = json.load(f)
+        for tk in data.get('tasks', []):
+            if tk.get('name') == entity:
+                tk['thumbnail'] = thumb_path
+        with open(reg, 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        return thumb_path, f"Thumbnail saved but registry update failed: {e}"
+
+    print(f"CGPipeline: Thumbnail updated -> {thumb_path}")
+    # Best-effort: push the new thumbnail up to Kitsu (runs in system Python).
+    fire_kitsu_sync(reg, entity, props.active_category, props.active_task_type, thumbnail=thumb_path)
+    return thumb_path, "Thumbnail updated."
+
+
+def _find_system_python():
+    if os.name == 'nt':
+        return shutil.which("pythonw") or shutil.which("python") or "python"
+    return shutil.which("python3") or shutil.which("python") or "python3"
+
+
+def fire_kitsu_sync(reg, entity, category, task_type, status=None, thumbnail=None):
+    """Fire-and-forget: push a task's status/thumbnail to Kitsu via the system
+    Python (which has gazu). Never blocks or raises into Blender."""
+    if not reg or not entity or not task_type:
+        return
+    script = os.path.normpath(os.path.join(STANDALONE_PATH, "core", "kitsu_sync.py"))
+    if not os.path.exists(script):
+        return
+    try:
+        cmd = [_find_system_python(), script,
+               "--registry", reg, "--entity", str(entity),
+               "--category", category or "Assets", "--task-type", task_type]
+        if status:
+            cmd += ["--status", status]
+        if thumbnail:
+            cmd += ["--thumbnail", thumbnail]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        subprocess.Popen(cmd, creationflags=creationflags)
+        print("CGPipeline: Kitsu sync dispatched.")
+    except Exception as e:
+        print(f"CGPipeline: Could not dispatch Kitsu sync: {e}")
+
 # --- PROPERTY GROUPS ---
 class CGP_ObjectItem(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name='Object Name')
@@ -154,9 +421,10 @@ class CGP_WindowManagerProps(bpy.types.PropertyGroup):
     format_enum: bpy.props.EnumProperty(name='Format', items=[('.abc', 'Alembic', ''), ('.usd', 'USD', ''), ('.fbx', 'FBX', ''), ('.blend', 'Blender', '')])
     range_mode: bpy.props.EnumProperty(name='Range', items=[('STILL', 'Still', ''), ('SLIDER', 'Slider', ''), ('CUSTOM', 'Custom', '')])
     start_frame: bpy.props.IntProperty(name='Start', default=1001); end_frame: bpy.props.IntProperty(name='End', default=1100)
-    status_enum: bpy.props.EnumProperty(name='Status', items=[('NO CHANGE', 'NO CHANGE', ''), ('Pending Review', 'Pending Review', ''), ('Approved', 'Approved', ''), ('In Progress', 'In Progress', '')])
+    status_enum: bpy.props.EnumProperty(name='Status', items=[('NO CHANGE', 'NO CHANGE', ''), ('Todo', 'Todo', ''), ('Work In Progress', 'Work In Progress', ''), ('Waiting For Approval', 'Waiting For Approval', ''), ('Retake', 'Retake', ''), ('Done', 'Done', '')])
     publish_separate: bpy.props.BoolProperty(name='Separate', default=False)
     include_materials: bpy.props.BoolProperty(name='Include Material', default=True)
+    auto_thumbnail: bpy.props.BoolProperty(name='Auto Thumbnail on Publish', default=True, description='Snapshot the viewport as the task thumbnail when publishing')
     
     # Assembly settings
     lookdev_items: bpy.props.CollectionProperty(type=CGP_LookdevFileItem); lookdev_index: bpy.props.IntProperty(default=0)
@@ -449,6 +717,9 @@ class CGP_OT_UpdateStatus(bpy.types.Operator):
             for tk in data.get('tasks', []):
                 if tk['id'] == tid: tk['status'] = props.status_enum; break
             with open(reg, 'w') as f: json.dump(data, f, indent=4)
+            # Best-effort: push the status change up to Kitsu.
+            fire_kitsu_sync(reg, props.active_entity, props.active_category,
+                            props.active_task_type, status=props.status_enum)
             self.report({'INFO'}, f"Status set to: {props.status_enum}"); return {'FINISHED'}
         except: return {'CANCELLED'}
 
@@ -622,6 +893,14 @@ class CGP_OT_PublishAction(bpy.types.Operator):
                     else: fn = f'{e}_{abbr}{fmt}'
                 do_export([i.name for i in props.publish_list], fn)
             
+            # Auto-snapshot a thumbnail for the task after a successful publish.
+            if getattr(props, 'auto_thumbnail', False):
+                try:
+                    _, tmsg = capture_task_thumbnail(props)
+                    print(f"CGPipeline: Auto thumbnail: {tmsg}")
+                except Exception as te:
+                    print(f"CGPipeline: Auto thumbnail failed: {te}")
+
             self.report({'INFO'}, f'Successfully published to: {pub}')
             return {'FINISHED'}
         except Exception as err:
@@ -629,6 +908,18 @@ class CGP_OT_PublishAction(bpy.types.Operator):
             traceback.print_exc()
             self.report({'ERROR'}, f'Publish failed: {str(err)}')
             return {'CANCELLED'}
+
+
+class CGP_OT_CaptureThumbnail(bpy.types.Operator):
+    bl_idname = 'cgp.capture_thumbnail'; bl_label = 'Snapshot Thumbnail'
+    bl_description = 'Capture the current viewport as the thumbnail for this task'
+    def execute(self, context):
+        path, msg = capture_task_thumbnail(context.window_manager.cgp_props)
+        if path:
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
+        self.report({'WARNING'}, msg)
+        return {'CANCELLED'}
 
 # --- OPERATORS (ASSEMBLY) ---
 class CGP_OT_AssemblyScan(bpy.types.Operator):
@@ -859,6 +1150,8 @@ class CGP_PT_PublishPanel(bpy.types.Panel):
             
         col.separator(); col.label(text="Selection List:"); col.template_list('CGP_UL_PublishList', '', p, 'publish_list', p, 'publish_list_index')
         r = col.row(align=True); r.operator('cgp.add_selected', text='Add', icon='ADD'); r.operator('cgp.remove_object', text='Remove', icon='REMOVE')
+        col.separator(); col.prop(p, 'auto_thumbnail', text='Auto Thumbnail on Publish')
+        col.operator('cgp.capture_thumbnail', text='Snapshot Thumbnail', icon='RESTRICT_RENDER_OFF')
         l.separator(); l.operator('cgp.publish_action', text='PUBLISH', icon='EXPORT')
 
 class CGP_PT_AssemblyPanel(bpy.types.Panel):
@@ -891,7 +1184,7 @@ classes = [
     CGP_ObjectItem, CGP_CacheFileItem, CGP_LookdevFileItem, CGP_CollectionLink, CGP_WindowManagerProps,
     CGP_UL_PublishList, CGP_UL_LookdevList, CGP_UL_CollectionLinkList,
     CGP_OT_OpenDashboard, CGP_OT_NormalSave, CGP_OT_SaveVersion, CGP_OT_UpdateStatus,
-    CGP_OT_AddSelected, CGP_OT_RemoveObject, CGP_OT_PublishAction, CGP_OT_FixTexturePaths, CGP_OT_SwitchTextureRes,
+    CGP_OT_AddSelected, CGP_OT_RemoveObject, CGP_OT_PublishAction, CGP_OT_CaptureThumbnail, CGP_OT_FixTexturePaths, CGP_OT_SwitchTextureRes,
     CGP_OT_AssemblyScan, CGP_OT_AssemblyImportLookdev, CGP_OT_AssemblyMakeOverride, 
     CGP_OT_AssemblyAssignPopup, CGP_OT_AssemblySetCache, CGP_OT_AssemblyApply,
     CGP_PT_MainPanel, CGP_PT_StatusPanel, CGP_PT_PublishPanel, CGP_PT_AssemblyPanel, CGP_MT_AssignMenu

@@ -1,50 +1,66 @@
-﻿from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, 
-                             QLabel, QPushButton, QScrollArea, QFrame, QFileDialog, QDialog, QLineEdit, QMenu, QFormLayout, QMessageBox, QComboBox, QSpinBox)
+﻿from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+                             QLabel, QPushButton, QScrollArea, QFrame, QFileDialog, QDialog, QLineEdit, QMenu, QFormLayout, QMessageBox, QComboBox, QSpinBox, QApplication)
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QAction
 import os
+import webbrowser
 from .user_management_dialog import UserManagementDialog
 
 class ProjectCard(QFrame):
     clicked = Signal(dict)
     modify_requested = Signal(dict)
     delete_requested = Signal(dict)
+    upload_requested = Signal(dict)
 
     def __init__(self, project_data, is_admin=False):
         super().__init__()
         self.project_data = project_data
         self.is_admin = is_admin
+        self.is_kitsu = bool(project_data.get("kitsu_id"))
         self.setFixedSize(250, 200)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
-        
-        self.setStyleSheet("""
-            QFrame { background-color: #2D2D2D; border-radius: 12px; border: 1px solid #3D3D3D; }
-            QFrame:hover { background-color: #353535; border: 1px solid #0078D4; }
-            QLabel { color: white; border: none; font-family: "Segoe UI"; }
-            #Thumb { background-color: #1A1A1A; border-radius: 8px; }
+
+        # Kitsu-linked projects get a teal accent; local projects keep the default.
+        accent = "#00B8A9" if self.is_kitsu else "#3D3D3D"
+        hover = "#1FD6C6" if self.is_kitsu else "#0078D4"
+        self.setStyleSheet(f"""
+            QFrame {{ background-color: #2D2D2D; border-radius: 12px; border: 1px solid {accent}; }}
+            QFrame:hover {{ background-color: #353535; border: 1px solid {hover}; }}
+            QLabel {{ color: white; border: none; font-family: "Segoe UI"; }}
+            #Thumb {{ background-color: #1A1A1A; border-radius: 8px; }}
+            #KitsuBadge {{ background-color: #00B8A9; color: white; font-size: 9px; font-weight: bold; border-radius: 4px; padding: 2px 6px; }}
+            #LocalBadge {{ background-color: #3A3A3A; color: #999; font-size: 9px; font-weight: bold; border-radius: 4px; padding: 2px 6px; }}
         """)
-        
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(5)
 
+        # Source badge row.
+        badge_row = QHBoxLayout()
+        badge = QLabel("KITSU" if self.is_kitsu else "LOCAL")
+        badge.setObjectName("KitsuBadge" if self.is_kitsu else "LocalBadge")
+        badge_row.addWidget(badge)
+        badge_row.addStretch()
+        layout.addLayout(badge_row)
+
         self.thumb = QLabel()
         self.thumb.setObjectName("Thumb")
-        self.thumb.setFixedSize(220, 100)
+        self.thumb.setFixedSize(220, 84)
         self.thumb.setAlignment(Qt.AlignCenter)
         self.update_thumbnail()
         layout.addWidget(self.thumb)
-        
+
         name = QLabel(self.project_data["name"])
         name.setStyleSheet("font-size: 16px; font-weight: bold; color: #EEEEEE;")
         name.setWordWrap(True)
         layout.addWidget(name)
-        
+
         info = QLabel(str(self.project_data.get("fps", 24)) + " fps | " + str(self.project_data.get("color_management", "ACES 1.3")))
         info.setStyleSheet("color: #888; font-size: 10px;")
         layout.addWidget(info)
-        
+
         layout.addStretch()
 
     def update_thumbnail(self):
@@ -63,26 +79,48 @@ class ProjectCard(QFrame):
     def show_context_menu(self, pos):
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { background-color: #2D2D2D; color: white; border: 1px solid #3D3D3D; } QMenu::item:selected { background-color: #0078D4; }")
-        
+
         if self.is_admin:
             modify_action = QAction("Modify Project Settings", self)
             modify_action.triggered.connect(lambda: self.modify_requested.emit(self.project_data))
             menu.addAction(modify_action)
-            
+
+            if self.is_kitsu:
+                open_action = QAction("Open in Kitsu (browser)", self)
+                open_action.triggered.connect(self.open_in_kitsu)
+                menu.addAction(open_action)
+            else:
+                upload_action = QAction("Upload to Kitsu", self)
+                upload_action.triggered.connect(lambda: self.upload_requested.emit(self.project_data))
+                menu.addAction(upload_action)
+
+            menu.addSeparator()
             delete_action = QAction("Delete Project", self)
             delete_action.triggered.connect(lambda: self.delete_requested.emit(self.project_data))
             menu.addAction(delete_action)
-            
+
         if not menu.isEmpty():
             menu.exec(self.mapToGlobal(pos))
+
+    def open_in_kitsu(self):
+        kid = self.project_data.get("kitsu_id", "")
+        host = self.project_data.get("kitsu_host", "")
+        if not kid or not host:
+            return
+        web = host[:-4] if host.endswith("/api") else host  # strip /api for the web URL
+        webbrowser.open(f"{web.rstrip('/')}/productions/{kid}/assets")
 
 class ProjectHubView(QWidget):
     project_selected = Signal(dict)
 
-    def __init__(self, hub_manager, auth_manager):
+    def __init__(self, hub_manager, auth_manager, kitsu=None):
         super().__init__()
         self.hub = hub_manager
         self.auth = auth_manager
+        if kitsu is None:
+            from core.kitsu import KitsuManager
+            kitsu = KitsuManager()
+        self.kitsu = kitsu
         self.setup_ui()
 
     def setup_ui(self):
@@ -187,6 +225,7 @@ class ProjectHubView(QWidget):
                 if self.auth.is_admin():
                     card.modify_requested.connect(self.on_modify_project)
                     card.delete_requested.connect(self.on_delete_project)
+                    card.upload_requested.connect(self.on_upload_to_kitsu)
                 self.grid.addWidget(card, index // 4, index % 4)
         else:
             # Show placeholder if root is set but no projects found
@@ -209,6 +248,50 @@ class ProjectHubView(QWidget):
 
     def on_modify_project(self, project_data):
         self.show_project_dialog(project_data)
+
+    def on_upload_to_kitsu(self, project_data):
+        from core.kitsu import KitsuManager
+        if not KitsuManager.available():
+            QMessageBox.warning(self, "Kitsu", "The 'gazu' package is not installed.\nRun: pip install gazu")
+            return
+
+        ok, msg = self.kitsu.ensure_connected(self.auth)
+        if not ok:
+            QMessageBox.information(self, "Connect to Kitsu", msg)
+            return
+
+        reply = QMessageBox.question(
+            self, "Upload to Kitsu",
+            f"Create '{project_data['name']}' on Kitsu and upload its assets, shots, "
+            f"and tasks?\n\nThis pushes the project up to {self.kitsu.host}.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            summary = self.kitsu.upload_project_to_kitsu(project_data, self.hub)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Kitsu Upload Failed", str(e))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not summary.get("ok"):
+            QMessageBox.warning(self, "Kitsu", summary.get("error", "Upload failed."))
+            return
+
+        QMessageBox.information(
+            self, "Uploaded to Kitsu",
+            f"'{summary['project']}' is now on Kitsu:\n"
+            f"{summary['assets']} assets, {summary['shots']} shots, "
+            f"{summary['tasks']} tasks"
+            + (f" ({summary['skipped']} skipped)" if summary.get("skipped") else "")
+            + ".",
+        )
+        self.refresh()
 
     def on_delete_project(self, project_data):
         # LEVEL 1: Standard Question

@@ -1,0 +1,6 @@
+# CGPipeline dependencies
+PySide6>=6.5
+
+# Optional: Kitsu (CGWire) production-tracker integration.
+# Only needed if you use the Kitsu menu; the app runs without it.
+gazu>=0.10

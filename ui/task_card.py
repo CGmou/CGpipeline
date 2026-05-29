@@ -3,6 +3,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QColor, QAction
 import os
 from core.utils import get_latest_version, build_work_filename
+from core.constants import STATUS_COLORS
 
 class TaskCard(QFrame):
     clicked = Signal(str)
@@ -10,10 +11,11 @@ class TaskCard(QFrame):
     continue_work_requested = Signal(dict)
     modify_requested = Signal(str)
 
-    def __init__(self, task_data, is_admin=False):
+    def __init__(self, task_data, is_admin=False, show_thumbs=True):
         super().__init__()
         self.task_data = task_data
         self.is_admin = is_admin
+        self.show_thumbs = show_thumbs
         self.setup_ui()
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
@@ -28,8 +30,8 @@ class TaskCard(QFrame):
         border_color = "#3D3D3D"
         bg_color = "#2D2D2D"
         is_critical = any(t.get("priority") in ["High", "Critical"] for t in self.task_data.get("all_task_objs", []))
-        is_done = all(t.get("status") == "Approved" for t in self.task_data.get("all_task_objs", []))
-        is_pending = any(t.get("status") == "Pending Review" for t in self.task_data.get("all_task_objs", []))
+        is_done = all(t.get("status") == "Done" for t in self.task_data.get("all_task_objs", []))
+        is_pending = any(t.get("status") == "Waiting For Approval" for t in self.task_data.get("all_task_objs", []))
 
         if is_critical:
             border_color = "#A72828"; bg_color = "#3A1A1A"
@@ -62,18 +64,19 @@ class TaskCard(QFrame):
         self.title_label.setWordWrap(True)
         layout.addWidget(self.title_label)
 
-        self.thumb_label = QLabel()
-        self.thumb_label.setFixedSize(220, 110)
-        self.thumb_label.setObjectName("Thumbnail")
-        self.thumb_label.setAlignment(Qt.AlignCenter)
+        if self.show_thumbs:
+            self.thumb_label = QLabel()
+            self.thumb_label.setFixedSize(220, 110)
+            self.thumb_label.setObjectName("Thumbnail")
+            self.thumb_label.setAlignment(Qt.AlignCenter)
 
-        thumb_path = self.task_data.get("thumbnail", "")
-        if thumb_path and os.path.exists(thumb_path):
-            pix = QPixmap(thumb_path).scaled(220, 110, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-            self.thumb_label.setPixmap(pix)
-        else:
-            self.thumb_label.setText("No Thumbnail")
-        layout.addWidget(self.thumb_label)
+            thumb_path = self.task_data.get("thumbnail", "")
+            if thumb_path and os.path.exists(thumb_path):
+                pix = QPixmap(thumb_path).scaled(220, 110, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                self.thumb_label.setPixmap(pix)
+            else:
+                self.thumb_label.setText("No Thumbnail")
+            layout.addWidget(self.thumb_label)
 
         self.task_list_container = QWidget()
         task_list_layout = QVBoxLayout(self.task_list_container)
@@ -110,9 +113,9 @@ class TaskCard(QFrame):
 
             t_status = QLabel(task_obj["status"])
             t_status.setObjectName("TaskStatus")
-            if task_obj["status"] == "Approved": t_status.setStyleSheet("color: #28A745;")
-            elif task_obj["status"] == "Pending Review": t_status.setStyleSheet("color: #0078D4;")
-            elif task_obj["status"] == "In Progress": t_status.setStyleSheet("color: #FFC107;")
+            status_color = STATUS_COLORS.get(task_obj["status"])
+            if status_color:
+                t_status.setStyleSheet(f"color: {status_color};")
             row_layout.addWidget(t_status)
 
             task_list_layout.addWidget(row)

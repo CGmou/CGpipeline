@@ -126,6 +126,10 @@ class CGPipelineApp(QMainWindow):
 
         self.auth = AuthManager(system_root)
         self.hub = HubManager(system_root)
+        # One shared Kitsu session for the whole app so connection state is
+        # consistent between the Kitsu dialog and the project hub.
+        from core.kitsu import KitsuManager
+        self.kitsu = KitsuManager()
 
         self.setup_menubar()
         self.stack = QStackedWidget()
@@ -135,11 +139,31 @@ class CGPipelineApp(QMainWindow):
         if settings.get("remember") and settings.get("last_user") and settings.get("last_pass"):
             user = self.auth.login(settings["last_user"], settings["last_pass"], remember=True)
             if user:
-                self.show_hub()
+                self.enter_app()
             else:
                 self.show_login()
         else:
             self.show_login()
+
+    def enter_app(self):
+        """After login, go straight to the active project's workspace when launched
+        from a DCC (env carries CGP_REGISTRY_PATH); otherwise show the project hub."""
+        self.show_hub()
+        dcc_reg = os.environ.get("CGP_REGISTRY_PATH", "")
+        in_dcc = os.environ.get("CGP_IN_DCC", "")
+        if in_dcc and dcc_reg and os.path.exists(dcc_reg):
+            project_path = os.path.normpath(os.path.dirname(dcc_reg))
+            project = None
+            try:
+                for p in self.hub.projects:
+                    if os.path.normpath(p.get("path", "")) == project_path:
+                        project = p
+                        break
+            except Exception:
+                project = None
+            if not project:
+                project = {"path": project_path, "name": os.path.basename(project_path)}
+            self.on_project_selected(project)
 
     def closeEvent(self, event):
         if hasattr(self, 'lock_file') and os.path.exists(self.lock_file):
@@ -156,12 +180,16 @@ class CGPipelineApp(QMainWindow):
             QMenu::item:selected { background-color: #0078D4; color: white; }
         """)
         settings_menu = menubar.addMenu("Settings")
-        
+
         root_action = settings_menu.addAction("Project Root")
         root_action.triggered.connect(self.on_open_root_settings)
-        
+
         paths_action = settings_menu.addAction("DCC Paths")
         paths_action.triggered.connect(self.on_open_dcc_settings)
+
+        kitsu_menu = menubar.addMenu("Kitsu")
+        kitsu_action = kitsu_menu.addAction("Production Tracker...")
+        kitsu_action.triggered.connect(self.on_open_kitsu)
 
     def on_open_root_settings(self):
         dialog = ProjectRootDialog(self.auth, self)
@@ -171,6 +199,21 @@ class CGPipelineApp(QMainWindow):
         dialog = DCCPathsDialog(self.auth, self)
         dialog.exec()
 
+    def on_open_kitsu(self):
+        # Imported lazily so the app starts even if gazu isn't installed.
+        from ui.kitsu_dialog import KitsuDialog
+        dialog = KitsuDialog(self.auth, self.hub, self.kitsu, self)
+        dialog.imported.connect(self.on_kitsu_imported)
+        dialog.exec()
+
+    def on_kitsu_imported(self):
+        # Refresh the hub so newly imported projects appear immediately.
+        if hasattr(self, "hub_view"):
+            try:
+                self.hub_view.refresh()
+            except Exception:
+                pass
+
     def show_login(self):
         self.login_view = LoginView(self.auth)
         self.login_view.login_success.connect(self.on_login_success)
@@ -178,10 +221,10 @@ class CGPipelineApp(QMainWindow):
         self.stack.setCurrentWidget(self.login_view)
 
     def on_login_success(self, user_data):
-        self.show_hub()
+        self.enter_app()
 
     def show_hub(self):
-        self.hub_view = ProjectHubView(self.hub, self.auth)
+        self.hub_view = ProjectHubView(self.hub, self.auth, kitsu=self.kitsu)
         self.hub_view.project_selected.connect(self.on_project_selected)
         self.stack.addWidget(self.hub_view)
         self.stack.setCurrentWidget(self.hub_view)
