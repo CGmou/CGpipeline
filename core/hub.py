@@ -100,6 +100,25 @@ class HubManager:
                 return True
         return False
 
+    def unlink_kitsu(self, project_id):
+        """Make a Kitsu-linked project local again, preserving the Kitsu link info
+        (in `kitsu_unlinked`) so it can be re-uploaded/re-linked later. Does not
+        touch anything on the Kitsu server or any local files."""
+        self.load_projects()
+        for p in self.projects:
+            if p["id"] == project_id:
+                if p.get("kitsu_id"):
+                    p["kitsu_unlinked"] = {
+                        "kitsu_id": p.get("kitsu_id", ""),
+                        "kitsu_host": p.get("kitsu_host", ""),
+                        "unlinked_at": datetime.now().isoformat(),
+                    }
+                    p.pop("kitsu_id", None)
+                    p.pop("kitsu_host", None)
+                    self.save_projects()
+                return True
+        return False
+
     def delete_project(self, project_id):
         self.load_projects()
         target_project = next((p for p in self.projects if p["id"] == project_id), None)

@@ -342,10 +342,21 @@ class KitsuManager:
             return {"ok": False, "error": "Not connected to Kitsu."}
 
         name = local_project.get("name", "Project")
-        try:
-            kproj = gazu.project.get_project_by_name(name)
-        except Exception:
-            kproj = None
+        kproj = None
+        # Prefer a previously-known Kitsu id (active link, or one preserved by an
+        # earlier "Unload from Kitsu") so re-upload re-links the same project.
+        prior_id = local_project.get("kitsu_id") or \
+            (local_project.get("kitsu_unlinked") or {}).get("kitsu_id")
+        if prior_id:
+            try:
+                kproj = gazu.project.get_project(prior_id)
+            except Exception:
+                kproj = None
+        if not kproj:
+            try:
+                kproj = gazu.project.get_project_by_name(name)
+            except Exception:
+                kproj = None
         if not kproj:
             try:
                 kproj = gazu.project.new_project(name)

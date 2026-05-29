@@ -11,6 +11,7 @@ class ProjectCard(QFrame):
     modify_requested = Signal(dict)
     delete_requested = Signal(dict)
     upload_requested = Signal(dict)
+    unload_requested = Signal(dict)
 
     def __init__(self, project_data, is_admin=False):
         super().__init__()
@@ -89,6 +90,10 @@ class ProjectCard(QFrame):
                 open_action = QAction("Open in Kitsu (browser)", self)
                 open_action.triggered.connect(self.open_in_kitsu)
                 menu.addAction(open_action)
+
+                unload_action = QAction("Unload from Kitsu", self)
+                unload_action.triggered.connect(lambda: self.unload_requested.emit(self.project_data))
+                menu.addAction(unload_action)
             else:
                 upload_action = QAction("Upload to Kitsu", self)
                 upload_action.triggered.connect(lambda: self.upload_requested.emit(self.project_data))
@@ -226,6 +231,7 @@ class ProjectHubView(QWidget):
                     card.modify_requested.connect(self.on_modify_project)
                     card.delete_requested.connect(self.on_delete_project)
                     card.upload_requested.connect(self.on_upload_to_kitsu)
+                    card.unload_requested.connect(self.on_unload_from_kitsu)
                 self.grid.addWidget(card, index // 4, index % 4)
         else:
             # Show placeholder if root is set but no projects found
@@ -291,6 +297,20 @@ class ProjectHubView(QWidget):
             + (f" ({summary['skipped']} skipped)" if summary.get("skipped") else "")
             + ".",
         )
+        self.refresh()
+
+    def on_unload_from_kitsu(self, project_data):
+        reply = QMessageBox.question(
+            self, "Unload from Kitsu",
+            f"Unlink '{project_data['name']}' from Kitsu?\n\n"
+            "The project stays here as a local project and its Kitsu link info is "
+            "saved, so you can re-upload it to the same Kitsu project later.\n\n"
+            "Nothing is removed from the Kitsu server or your drive.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.hub.unlink_kitsu(project_data["id"])
         self.refresh()
 
     def on_delete_project(self, project_data):
