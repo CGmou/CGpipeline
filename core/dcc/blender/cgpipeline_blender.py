@@ -125,6 +125,75 @@ def find_matching_object_path(object_name_full, cache_db):
         if l.endswith(name): return paths[i]
     return None
 
+
+def capture_task_thumbnail(props):
+    """Render the active 3D viewport to a PNG and set it as the thumbnail for every
+    task of the current entity in the registry. Returns the thumbnail path or None."""
+    reg = props.active_reg_path or os.environ.get('CGP_REGISTRY_PATH', '')
+    entity = props.active_entity or os.environ.get('CGP_ENTITY_NAME', '')
+    if not reg or not os.path.exists(reg) or not entity:
+        print("CGPipeline: No task context for thumbnail.")
+        return None
+
+    project_root = os.path.dirname(reg)
+    thumbs_dir = os.path.join(project_root, ".thumbnails")
+    try:
+        os.makedirs(thumbs_dir, exist_ok=True)
+    except Exception as e:
+        print(f"CGPipeline: Could not create thumbnails dir: {e}")
+        return None
+    clean = str(entity).replace(" ", "_")
+    thumb_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
+
+    scene = bpy.context.scene
+    rs = scene.render
+    saved = (rs.filepath, rs.resolution_x, rs.resolution_y, rs.resolution_percentage,
+             rs.image_settings.file_format)
+    try:
+        rs.image_settings.file_format = 'PNG'
+        rs.resolution_x, rs.resolution_y, rs.resolution_percentage = 512, 288, 100
+        rs.filepath = thumb_path
+        # Render what the artist sees in the viewport (not the camera).
+        try:
+            bpy.ops.render.opengl(write_still=True, view_context=True)
+        except Exception:
+            bpy.ops.render.opengl(write_still=True)
+    except Exception as e:
+        print(f"CGPipeline: Thumbnail render failed: {e}")
+        return None
+    finally:
+        (rs.filepath, rs.resolution_x, rs.resolution_y, rs.resolution_percentage,
+         rs.image_settings.file_format) = saved
+
+    # Blender appends the frame number/extension; resolve the actual written file.
+    if not os.path.exists(thumb_path):
+        alt = thumb_path[:-4] + f"{scene.frame_current:04d}.png"
+        if os.path.exists(alt):
+            try:
+                if os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+                os.rename(alt, thumb_path)
+            except Exception:
+                thumb_path = alt
+    if not os.path.exists(thumb_path):
+        print("CGPipeline: Thumbnail file was not written.")
+        return None
+
+    # Update the registry so the dashboard card picks it up.
+    try:
+        with open(reg, 'r') as f:
+            data = json.load(f)
+        for tk in data.get('tasks', []):
+            if tk.get('name') == entity:
+                tk['thumbnail'] = thumb_path
+        with open(reg, 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"CGPipeline: Could not update registry thumbnail: {e}")
+
+    print(f"CGPipeline: Thumbnail updated -> {thumb_path}")
+    return thumb_path
+
 # --- PROPERTY GROUPS ---
 class CGP_ObjectItem(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name='Object Name')
@@ -157,6 +226,7 @@ class CGP_WindowManagerProps(bpy.types.PropertyGroup):
     status_enum: bpy.props.EnumProperty(name='Status', items=[('NO CHANGE', 'NO CHANGE', ''), ('Todo', 'Todo', ''), ('Work In Progress', 'Work In Progress', ''), ('Waiting For Approval', 'Waiting For Approval', ''), ('Retake', 'Retake', ''), ('Done', 'Done', '')])
     publish_separate: bpy.props.BoolProperty(name='Separate', default=False)
     include_materials: bpy.props.BoolProperty(name='Include Material', default=True)
+    auto_thumbnail: bpy.props.BoolProperty(name='Auto Thumbnail on Publish', default=True, description='Snapshot the viewport as the task thumbnail when publishing')
     
     # Assembly settings
     lookdev_items: bpy.props.CollectionProperty(type=CGP_LookdevFileItem); lookdev_index: bpy.props.IntProperty(default=0)
@@ -622,6 +692,13 @@ class CGP_OT_PublishAction(bpy.types.Operator):
                     else: fn = f'{e}_{abbr}{fmt}'
                 do_export([i.name for i in props.publish_list], fn)
             
+            # Auto-snapshot a thumbnail for the task after a successful publish.
+            if getattr(props, 'auto_thumbnail', False):
+                try:
+                    capture_task_thumbnail(props)
+                except Exception as te:
+                    print(f"CGPipeline: Auto thumbnail failed: {te}")
+
             self.report({'INFO'}, f'Successfully published to: {pub}')
             return {'FINISHED'}
         except Exception as err:
@@ -629,6 +706,18 @@ class CGP_OT_PublishAction(bpy.types.Operator):
             traceback.print_exc()
             self.report({'ERROR'}, f'Publish failed: {str(err)}')
             return {'CANCELLED'}
+
+
+class CGP_OT_CaptureThumbnail(bpy.types.Operator):
+    bl_idname = 'cgp.capture_thumbnail'; bl_label = 'Snapshot Thumbnail'
+    bl_description = 'Capture the current viewport as the thumbnail for this task'
+    def execute(self, context):
+        path = capture_task_thumbnail(context.window_manager.cgp_props)
+        if path:
+            self.report({'INFO'}, 'Thumbnail updated.')
+            return {'FINISHED'}
+        self.report({'WARNING'}, 'Could not capture thumbnail (open via Dashboard?).')
+        return {'CANCELLED'}
 
 # --- OPERATORS (ASSEMBLY) ---
 class CGP_OT_AssemblyScan(bpy.types.Operator):
@@ -859,6 +948,8 @@ class CGP_PT_PublishPanel(bpy.types.Panel):
             
         col.separator(); col.label(text="Selection List:"); col.template_list('CGP_UL_PublishList', '', p, 'publish_list', p, 'publish_list_index')
         r = col.row(align=True); r.operator('cgp.add_selected', text='Add', icon='ADD'); r.operator('cgp.remove_object', text='Remove', icon='REMOVE')
+        col.separator(); col.prop(p, 'auto_thumbnail', text='Auto Thumbnail on Publish')
+        col.operator('cgp.capture_thumbnail', text='Snapshot Thumbnail', icon='RESTRICT_RENDER_OFF')
         l.separator(); l.operator('cgp.publish_action', text='PUBLISH', icon='EXPORT')
 
 class CGP_PT_AssemblyPanel(bpy.types.Panel):
@@ -891,7 +982,7 @@ classes = [
     CGP_ObjectItem, CGP_CacheFileItem, CGP_LookdevFileItem, CGP_CollectionLink, CGP_WindowManagerProps,
     CGP_UL_PublishList, CGP_UL_LookdevList, CGP_UL_CollectionLinkList,
     CGP_OT_OpenDashboard, CGP_OT_NormalSave, CGP_OT_SaveVersion, CGP_OT_UpdateStatus,
-    CGP_OT_AddSelected, CGP_OT_RemoveObject, CGP_OT_PublishAction, CGP_OT_FixTexturePaths, CGP_OT_SwitchTextureRes,
+    CGP_OT_AddSelected, CGP_OT_RemoveObject, CGP_OT_PublishAction, CGP_OT_CaptureThumbnail, CGP_OT_FixTexturePaths, CGP_OT_SwitchTextureRes,
     CGP_OT_AssemblyScan, CGP_OT_AssemblyImportLookdev, CGP_OT_AssemblyMakeOverride, 
     CGP_OT_AssemblyAssignPopup, CGP_OT_AssemblySetCache, CGP_OT_AssemblyApply,
     CGP_PT_MainPanel, CGP_PT_StatusPanel, CGP_PT_PublishPanel, CGP_PT_AssemblyPanel, CGP_MT_AssignMenu
