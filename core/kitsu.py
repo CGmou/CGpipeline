@@ -169,46 +169,6 @@ class KitsuManager:
             return self.connect(host, email, pw)
         return False, "Not connected to Kitsu. Open Kitsu → Production Tracker and connect first."
 
-    def remove_project_from_kitsu(self, local_project):
-        """Delete the project on the Kitsu server. Returns (ok, message). Used by
-        'Unload from Kitsu' so the project no longer exists on Kitsu."""
-        import gazu
-        if not self.connected:
-            return False, "Not connected to Kitsu."
-        kid = local_project.get("kitsu_id") or \
-            (local_project.get("kitsu_unlinked") or {}).get("kitsu_id")
-        kproj = None
-        if kid:
-            try:
-                kproj = gazu.project.get_project(kid)
-            except Exception:
-                kproj = None
-        if not kproj and local_project.get("name"):
-            try:
-                kproj = gazu.project.get_project_by_name(local_project["name"])
-            except Exception:
-                kproj = None
-        if not kproj:
-            return True, "Already absent from Kitsu."
-
-        pid = kproj["id"]
-        # Delete via the raw API. gazu.project.remove_project(force=True) is buggy in
-        # some versions (passes `force` as the request params), so try the raw client
-        # delete first and fall back.
-        attempts = [
-            lambda: gazu.client.delete("data/projects/%s" % pid, {"force": "true"}),
-            lambda: gazu.client.delete("data/projects/%s?force=true" % pid),
-            lambda: gazu.project.remove_project(kproj, force=True),
-        ]
-        last_err = None
-        for attempt in attempts:
-            try:
-                attempt()
-                return True, "Removed from Kitsu."
-            except Exception as e:
-                last_err = e
-        return False, f"Could not remove from Kitsu: {last_err}"
-
     def _download_project_avatar(self, kproj, dest):
         import gazu
         if not kproj.get("has_avatar"):

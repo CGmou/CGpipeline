@@ -11,7 +11,6 @@ class ProjectCard(QFrame):
     modify_requested = Signal(dict)
     delete_requested = Signal(dict)
     upload_requested = Signal(dict)
-    unload_requested = Signal(dict)
 
     def __init__(self, project_data, is_admin=False):
         super().__init__()
@@ -90,10 +89,6 @@ class ProjectCard(QFrame):
                 open_action = QAction("Open in Kitsu (browser)", self)
                 open_action.triggered.connect(self.open_in_kitsu)
                 menu.addAction(open_action)
-
-                unload_action = QAction("Unload from Kitsu", self)
-                unload_action.triggered.connect(lambda: self.unload_requested.emit(self.project_data))
-                menu.addAction(unload_action)
             else:
                 upload_action = QAction("Upload to Kitsu", self)
                 upload_action.triggered.connect(lambda: self.upload_requested.emit(self.project_data))
@@ -231,7 +226,6 @@ class ProjectHubView(QWidget):
                     card.modify_requested.connect(self.on_modify_project)
                     card.delete_requested.connect(self.on_delete_project)
                     card.upload_requested.connect(self.on_upload_to_kitsu)
-                    card.unload_requested.connect(self.on_unload_from_kitsu)
                 self.grid.addWidget(card, index // 4, index % 4)
         else:
             # Show placeholder if root is set but no projects found
@@ -297,48 +291,6 @@ class ProjectHubView(QWidget):
             + (f" ({summary['skipped']} skipped)" if summary.get("skipped") else "")
             + ".",
         )
-        self.refresh()
-
-    def on_unload_from_kitsu(self, project_data):
-        from core.kitsu import KitsuManager
-        if not KitsuManager.available():
-            QMessageBox.warning(self, "Kitsu", "The 'gazu' package is not installed.\nRun: pip install gazu")
-            return
-
-        ok, msg = self.kitsu.ensure_connected(self.auth)
-        if not ok:
-            QMessageBox.information(self, "Connect to Kitsu", msg)
-            return
-
-        reply = QMessageBox.question(
-            self, "Unload from Kitsu",
-            f"Remove '{project_data['name']}' from Kitsu?\n\n"
-            f"This DELETES the project on the Kitsu server ({self.kitsu.host}).\n"
-            "The project stays here as a local project (your files and tasks are "
-            "kept), and you can re-upload it to Kitsu later.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            ok, msg = self.kitsu.remove_project_from_kitsu(project_data)
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Kitsu", f"Failed to remove from Kitsu:\n{e}")
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        if not ok:
-            QMessageBox.warning(self, "Kitsu", msg)
-            return
-
-        # Removed on the server -> now make it local-only (link info preserved).
-        self.hub.unlink_kitsu(project_data["id"])
-        QMessageBox.information(self, "Unloaded from Kitsu",
-                               f"'{project_data['name']}' was removed from Kitsu and is now a local project.")
         self.refresh()
 
     def on_delete_project(self, project_data):
