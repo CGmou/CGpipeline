@@ -99,6 +99,7 @@ class KitsuManager:
         self.host = ""
         self.email = ""
         self.user_name = ""
+        self.user_role = ""
 
     @staticmethod
     def available():
@@ -141,10 +142,24 @@ class KitsuManager:
             )
             if full:
                 self.user_name = full
+            self.user_role = user.get("role", "")
         except Exception:
             pass
 
         return True, f"Connected to {api_host} as {self.user_name}"
+
+    def pipeline_role(self):
+        """Map the Kitsu role to a CGPipeline role."""
+        return "admin" if self.user_role in ("admin", "manager") else "artist"
+
+    def all_project_ids(self):
+        """Set of all Kitsu project ids (open + closed), or None on error.
+        None means 'could not determine' so callers must not treat it as 'deleted'."""
+        import gazu
+        try:
+            return {p.get("id") for p in gazu.project.all_projects()}
+        except Exception:
+            return None
 
     def disconnect(self):
         """Log out and clear connection state."""
@@ -355,8 +370,20 @@ class KitsuManager:
         projects = self.list_projects()
         totals = {
             "ok": True, "projects": 0, "assets": 0, "shots": 0,
-            "tasks": 0, "skipped": 0, "names": [],
+            "tasks": 0, "skipped": 0, "names": [], "unloaded": [],
         }
+
+        # Reconcile: any local project linked to a Kitsu project that no longer
+        # exists on the server gets unloaded (becomes a local project, files kept).
+        hub.set_project_root(root_dir)
+        live_ids = self.all_project_ids()
+        if live_ids is not None:
+            for p in list(hub.projects):
+                kid = p.get("kitsu_id")
+                if kid and kid not in live_ids:
+                    if hub.mark_project_local(p["id"]):
+                        totals["unloaded"].append(p.get("name", ""))
+
         n = len(projects)
         for i, p in enumerate(projects):
             if progress:

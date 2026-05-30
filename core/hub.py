@@ -100,6 +100,20 @@ class HubManager:
                 return True
         return False
 
+    def mark_project_local(self, project_id):
+        """Drop a project's Kitsu link so it becomes a plain local project. Keeps
+        all files and tasks. Used when the Kitsu project was deleted on the server."""
+        self.load_projects()
+        for p in self.projects:
+            if p["id"] == project_id:
+                if p.get("kitsu_id") or p.get("kitsu_host"):
+                    p.pop("kitsu_id", None)
+                    p.pop("kitsu_host", None)
+                    self.save_projects()
+                    return True
+                return False
+        return False
+
     def delete_project(self, project_id):
         self.load_projects()
         target_project = next((p for p in self.projects if p["id"] == project_id), None)
