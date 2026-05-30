@@ -51,6 +51,10 @@ class UserManagementDialog(QDialog):
         self.role_combo = QComboBox()
         self.role_combo.addItems(["admin", "artist"])
         form.addRow("Role:", self.role_combo)
+
+        self.kitsu_edit = QLineEdit()
+        self.kitsu_edit.setPlaceholderText("Kitsu email (links this user to Kitsu)")
+        form.addRow("Kitsu Email:", self.kitsu_edit)
         
         right_layout.addWidget(QLabel("Assign Projects:"))
         self.proj_list = QListWidget()
@@ -123,6 +127,7 @@ class UserManagementDialog(QDialog):
             self.name_edit.setText(user["username"])
             self.pass_edit.setText(user.get("password", ""))
             self.role_combo.setCurrentText(user.get("role", "artist"))
+            self.kitsu_edit.setText(user.get("kitsu_email", ""))
             self.update_btn.setEnabled(True)
             self.add_btn.setEnabled(False)
             self.load_user_projects(user)
@@ -131,8 +136,11 @@ class UserManagementDialog(QDialog):
         name = self.name_edit.text().strip()
         pwd = self.pass_edit.text()
         role = self.role_combo.currentText()
+        kitsu_email = self.kitsu_edit.text().strip()
         if not name or not pwd: return
         if self.auth.add_user(name, role, pwd):
+            if kitsu_email:
+                self.auth.update_user(name, kitsu_email=kitsu_email)
             self.refresh_list()
             self.clear_inputs()
 
@@ -140,13 +148,14 @@ class UserManagementDialog(QDialog):
         name = self.name_edit.text().strip()
         pwd = self.pass_edit.text()
         role = self.role_combo.currentText()
+        kitsu_email = self.kitsu_edit.text().strip()
         selected_projs = []
         for i in range(self.proj_list.count()):
             item = self.proj_list.item(i)
             if item.checkState() == Qt.Checked:
                 selected_projs.append(item.data(Qt.UserRole))
-        
-        if self.auth.update_user(name, password=pwd, role=role):
+
+        if self.auth.update_user(name, password=pwd, role=role, kitsu_email=kitsu_email):
             self.refresh_list()
             self.clear_inputs()
 
@@ -164,6 +173,7 @@ class UserManagementDialog(QDialog):
     def clear_inputs(self):
         self.name_edit.clear()
         self.pass_edit.clear()
+        self.kitsu_edit.clear()
         self.user_list.clearSelection()
         self.update_btn.setEnabled(False)
         self.add_btn.setEnabled(True)
