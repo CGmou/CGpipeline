@@ -186,11 +186,22 @@ class KitsuManager:
 
     def _download_project_avatar(self, kproj, dest):
         import gazu
-        if not kproj.get("has_avatar"):
+        pid = kproj.get("id")
+        if not pid:
+            return None
+        has_avatar = kproj.get("has_avatar")
+        # The list endpoint may omit has_avatar; re-fetch the full project to be sure.
+        if not has_avatar:
+            try:
+                has_avatar = gazu.project.get_project(pid).get("has_avatar")
+            except Exception:
+                has_avatar = None
+        if not has_avatar:
             return None
         try:
-            gazu.client.download_file(f"pictures/thumbnails/projects/{kproj['id']}.png", dest)
-            return dest if os.path.exists(dest) and os.path.getsize(dest) > 0 else None
+            gazu.client.download_file(f"pictures/thumbnails/projects/{pid}.png", dest)
+            # > 256 bytes guards against a saved error/empty body.
+            return dest if os.path.exists(dest) and os.path.getsize(dest) > 256 else None
         except Exception:
             return None
 
@@ -400,6 +411,71 @@ class KitsuManager:
                 totals["skipped"] += s.get("skipped", 0)
                 totals["names"].append(s.get("project", ""))
         return totals
+
+    def sync_users_and_assignments(self, auth, hub):
+        """Pull Kitsu people into local users: sync each linked user's role from
+        Kitsu (#3) and their project assignments from each Kitsu project's team
+        (#4). Matches local users to Kitsu persons by kitsu_email. Returns a dict
+        with counts. Local-only (non-Kitsu) project assignments are preserved."""
+        import gazu
+        result = {"roles": 0, "assignments": 0}
+
+        try:
+            persons = gazu.person.all_persons()
+        except Exception:
+            persons = []
+        by_id = {p.get("id"): p for p in persons}
+        email_to_person = {(p.get("email") or "").lower(): p for p in persons if p.get("email")}
+
+        def role_for(person):
+            return "admin" if (person or {}).get("role") in ("admin", "manager") else "artist"
+
+        # --- #3 Roles ---
+        for u in auth.users:
+            ke = (u.get("kitsu_email") or "").lower()
+            person = email_to_person.get(ke) if ke else None
+            if person:
+                new_role = role_for(person)
+                if u.get("role") != new_role:
+                    u["role"] = new_role
+                    result["roles"] += 1
+
+        # --- #4 Assignments (mirror Kitsu project teams) ---
+        try:
+            kprojects = gazu.project.all_projects()
+        except Exception:
+            kprojects = []
+        # kitsu project id -> set of member emails
+        proj_member_emails = {}
+        for kp in kprojects:
+            emails = set()
+            for pid in (kp.get("team") or []):
+                per = by_id.get(pid)
+                if per and per.get("email"):
+                    emails.add(per["email"].lower())
+            proj_member_emails[kp.get("id")] = emails
+
+        hub.load_projects()
+        kitsu_local = {lp.get("kitsu_id"): lp["id"] for lp in hub.projects if lp.get("kitsu_id")}
+        kitsu_local_ids = set(kitsu_local.values())
+
+        for u in auth.users:
+            ke = (u.get("kitsu_email") or "").lower()
+            if not ke:
+                continue
+            current = set(u.get("projects", []))
+            # Keep assignments to local-only (non-Kitsu) projects untouched.
+            new_set = {pid for pid in current if pid not in kitsu_local_ids}
+            for kid, local_id in kitsu_local.items():
+                if ke in proj_member_emails.get(kid, set()):
+                    new_set.add(local_id)
+            if new_set != current:
+                u["projects"] = list(new_set)
+                result["assignments"] += 1
+
+        if result["roles"] or result["assignments"]:
+            auth.save_users()
+        return result
 
     def upload_project_to_kitsu(self, local_project, hub, progress=None):
         """Push a local CGPipeline project up to Kitsu (one-way: pipeline -> Kitsu),
