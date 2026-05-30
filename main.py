@@ -215,7 +215,13 @@ class CGPipelineApp(QMainWindow):
                 pass
 
     def show_login(self):
-        self.login_view = LoginView(self.auth)
+        # End any Kitsu session on logout so the next login starts fresh and the
+        # Kitsu dialog doesn't keep showing the previous Kitsu user.
+        try:
+            self.kitsu.disconnect()
+        except Exception:
+            pass
+        self.login_view = LoginView(self.auth, self.kitsu)
         self.login_view.login_success.connect(self.on_login_success)
         self.stack.addWidget(self.login_view)
         self.stack.setCurrentWidget(self.login_view)
