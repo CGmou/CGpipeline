@@ -55,6 +55,35 @@ class AuthManager:
         self.save_users()
         return True
 
+    def login_with_kitsu(self, email, full_name, role="artist"):
+        """Log in via Kitsu. Finds the local user linked to this Kitsu account
+        (by kitsu_email, else by matching username), or creates one, links it,
+        sets it as the current user, and returns it."""
+        email_l = (email or "").lower()
+        user = next((u for u in self.users if u.get("kitsu_email", "").lower() == email_l and email_l), None)
+        if not user and full_name:
+            user = next((u for u in self.users if u["username"].lower() == full_name.lower()), None)
+
+        if not user:
+            username = full_name or (email.split("@")[0] if email else "kitsu_user")
+            base, i = username, 1
+            while any(u["username"] == username for u in self.users):
+                i += 1
+                username = f"{base}{i}"
+            user = {
+                "username": username, "role": role, "password": "",
+                "projects": [], "kitsu_email": email, "kitsu_name": full_name,
+            }
+            self.users.append(user)
+        else:
+            user["kitsu_email"] = email
+            user["kitsu_name"] = full_name
+            if role:
+                user["role"] = role
+        self.save_users()
+        self.current_user = user
+        return user
+
     def update_user(self, username, **kwargs):
         for user in self.users:
             if user["username"] == username:
