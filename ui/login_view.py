@@ -5,9 +5,10 @@ from PySide6.QtCore import Signal, Qt
 class LoginView(QWidget):
     login_success = Signal(dict)
 
-    def __init__(self, auth_manager):
+    def __init__(self, auth_manager, kitsu=None):
         super().__init__()
         self.auth = auth_manager
+        self.kitsu = kitsu
         self.setup_ui()
 
     def setup_ui(self):
@@ -91,7 +92,7 @@ class LoginView(QWidget):
             status.setText("Connecting…")
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
-                km = KitsuManager()
+                km = self.kitsu or KitsuManager()
                 ok, msg = km.connect(host, email, pw)
             finally:
                 QApplication.restoreOverrideCursor()

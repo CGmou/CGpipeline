@@ -164,12 +164,19 @@ class KitsuDialog(QDialog):
         if s.get("kitsu_remember") and s.get("kitsu_pass"):
             self.pass_edit.setText(s.get("kitsu_pass", ""))
         # If the shared session is already connected, just show that. Otherwise
-        # auto-connect from remembered credentials so the user lands on the
-        # clean connected view.
+        # auto-connect from remembered credentials ONLY when the logged-in user
+        # actually owns that Kitsu account — so a local-user login doesn't silently
+        # reconnect as the previous Kitsu user.
         if self.kitsu.connected:
             self._show_state()
-        elif s.get("kitsu_remember") and s.get("kitsu_pass"):
+        elif s.get("kitsu_remember") and s.get("kitsu_pass") and self._current_user_owns_kitsu():
             self._connect(silent=True)
+
+    def _current_user_owns_kitsu(self):
+        s = self.auth.settings
+        saved = (s.get("kitsu_email") or "").lower()
+        cur = ((self.auth.current_user or {}).get("kitsu_email") or "").lower()
+        return bool(saved) and saved == cur
 
     # ---- handlers ----
     def _connect(self, silent=False):
@@ -237,6 +244,13 @@ class KitsuDialog(QDialog):
             totals = self.kitsu.import_all_projects(
                 self.hub, root, current_user=current_user, progress=progress,
             )
+            # Also sync user roles + project assignments from Kitsu.
+            self.summary_label.setText("Syncing users & assignments…")
+            QApplication.processEvents()
+            try:
+                user_sync = self.kitsu.sync_users_and_assignments(self.auth, self.hub)
+            except Exception:
+                user_sync = {"roles": 0, "assignments": 0}
         except Exception as e:
             QApplication.restoreOverrideCursor()
             self.sync_btn.setEnabled(True)
@@ -246,11 +260,14 @@ class KitsuDialog(QDialog):
             QApplication.restoreOverrideCursor()
             self.sync_btn.setEnabled(True)
 
-        self.summary_label.setText(
+        msg = (
             f"Synced {totals['projects']} project(s): "
-            f"{totals['assets']} assets, {totals['shots']} shots, "
-            f"{totals['tasks']} tasks"
+            f"{totals['assets']} assets, {totals['shots']} shots, {totals['tasks']} tasks"
             + (f" ({totals['skipped']} skipped)" if totals.get("skipped") else "")
-            + "."
         )
+        if totals.get("unloaded"):
+            msg += f"; unloaded {len(totals['unloaded'])} deleted project(s)"
+        if user_sync.get("roles") or user_sync.get("assignments"):
+            msg += f"; updated {user_sync['roles']} role(s), {user_sync['assignments']} assignment(s)"
+        self.summary_label.setText(msg + ".")
         self.imported.emit()
