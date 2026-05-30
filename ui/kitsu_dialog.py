@@ -237,6 +237,13 @@ class KitsuDialog(QDialog):
             totals = self.kitsu.import_all_projects(
                 self.hub, root, current_user=current_user, progress=progress,
             )
+            # Also sync user roles + project assignments from Kitsu.
+            self.summary_label.setText("Syncing users & assignments…")
+            QApplication.processEvents()
+            try:
+                user_sync = self.kitsu.sync_users_and_assignments(self.auth, self.hub)
+            except Exception:
+                user_sync = {"roles": 0, "assignments": 0}
         except Exception as e:
             QApplication.restoreOverrideCursor()
             self.sync_btn.setEnabled(True)
@@ -246,11 +253,14 @@ class KitsuDialog(QDialog):
             QApplication.restoreOverrideCursor()
             self.sync_btn.setEnabled(True)
 
-        self.summary_label.setText(
+        msg = (
             f"Synced {totals['projects']} project(s): "
-            f"{totals['assets']} assets, {totals['shots']} shots, "
-            f"{totals['tasks']} tasks"
+            f"{totals['assets']} assets, {totals['shots']} shots, {totals['tasks']} tasks"
             + (f" ({totals['skipped']} skipped)" if totals.get("skipped") else "")
-            + "."
         )
+        if totals.get("unloaded"):
+            msg += f"; unloaded {len(totals['unloaded'])} deleted project(s)"
+        if user_sync.get("roles") or user_sync.get("assignments"):
+            msg += f"; updated {user_sync['roles']} role(s), {user_sync['assignments']} assignment(s)"
+        self.summary_label.setText(msg + ".")
         self.imported.emit()

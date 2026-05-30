@@ -214,12 +214,18 @@ class ProjectHubView(QWidget):
         else:
             self.root_label.setText("Please select a project root to see projects.")
 
-        for i in reversed(range(self.grid.count())): 
+        for i in reversed(range(self.grid.count())):
             widget = self.grid.itemAt(i).widget()
             if widget: widget.setParent(None)
-            
-        if self.hub.projects:
-            for index, project in enumerate(self.hub.projects):
+
+        # Non-admins only see the projects assigned to them.
+        projects = self.hub.projects
+        if not self.auth.is_admin():
+            assigned = set((self.auth.current_user or {}).get("projects", []))
+            projects = [p for p in projects if p.get("id") in assigned]
+
+        if projects:
+            for index, project in enumerate(projects):
                 card = ProjectCard(project, is_admin=self.auth.is_admin())
                 card.clicked.connect(self.project_selected.emit)
                 if self.auth.is_admin():
@@ -228,9 +234,11 @@ class ProjectHubView(QWidget):
                     card.upload_requested.connect(self.on_upload_to_kitsu)
                 self.grid.addWidget(card, index // 4, index % 4)
         else:
-            # Show placeholder if root is set but no projects found
+            # Placeholder when the root is set but there's nothing to show.
             if root:
-                placeholder = QLabel("No projects found in this root folder.")
+                text = ("No projects found in this root folder." if self.auth.is_admin()
+                        else "No projects assigned to you yet.")
+                placeholder = QLabel(text)
                 placeholder.setStyleSheet("color: #555; font-size: 14px; margin-top: 20px;")
                 self.grid.addWidget(placeholder, 0, 0)
 
