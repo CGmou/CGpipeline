@@ -64,7 +64,10 @@ class ProjectCard(QFrame):
         layout.addStretch()
 
     def update_thumbnail(self):
+        from core.utils import get_placeholder_thumbnail
         thumb_path = self.project_data.get("thumbnail", "")
+        if not (thumb_path and os.path.exists(thumb_path)):
+            thumb_path = get_placeholder_thumbnail()
         if thumb_path and os.path.exists(thumb_path):
             pix = QPixmap(thumb_path).scaled(220, 100, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             self.thumb.setPixmap(pix)

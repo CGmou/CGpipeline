@@ -2,7 +2,7 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QColor, QAction
 import os
-from core.utils import get_latest_version, build_work_filename
+from core.utils import get_latest_version, build_work_filename, get_placeholder_thumbnail
 from core.constants import STATUS_COLORS
 
 class TaskCard(QFrame):
@@ -71,6 +71,8 @@ class TaskCard(QFrame):
             self.thumb_label.setAlignment(Qt.AlignCenter)
 
             thumb_path = self.task_data.get("thumbnail", "")
+            if not (thumb_path and os.path.exists(thumb_path)):
+                thumb_path = get_placeholder_thumbnail()
             if thumb_path and os.path.exists(thumb_path):
                 pix = QPixmap(thumb_path).scaled(220, 110, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
                 self.thumb_label.setPixmap(pix)
