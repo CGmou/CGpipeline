@@ -5,6 +5,15 @@ ASSET_GROUP_ABBR = {
     "Char": "CH", "Props": "PR", "Sets": "ST", "Vehicles": "VH"
 }
 
+def get_placeholder_thumbnail():
+    """Absolute path to the bundled placeholder thumbnail (resolved relative to the
+    repo so it works on any machine), or "" if it's missing."""
+    here = os.path.dirname(os.path.abspath(__file__))   # core/
+    root = os.path.dirname(here)                         # repo root
+    p = os.path.join(root, "resources", "thumnail_placeholder.jpg")
+    return p if os.path.exists(p) else ""
+
+
 def is_safe_subpath(target, root):
     """True only when `target` resolves to a path strictly inside `root`.
     Used as a guard before destructive operations like shutil.rmtree."""

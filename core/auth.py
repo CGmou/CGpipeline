@@ -44,6 +44,7 @@ class AuthManager:
         for user in self.users:
             if user["username"] == username and user["password"] == password:
                 self.current_user = user
+                self.settings["last_login_method"] = "local"
                 self.save_settings(username, password if remember else "", remember)
                 return user
         return None
@@ -82,6 +83,8 @@ class AuthManager:
                 user["role"] = role
         self.save_users()
         self.current_user = user
+        self.settings["last_login_method"] = "kitsu"
+        self.save()
         return user
 
     def update_user(self, username, **kwargs):
@@ -113,6 +116,7 @@ class AuthManager:
             "kitsu_email": "",
             "kitsu_pass": "",
             "kitsu_remember": False,
+            "last_login_method": "",
         }
         
         if os.path.exists(self.settings_file):
