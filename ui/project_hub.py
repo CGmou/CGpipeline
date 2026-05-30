@@ -17,7 +17,7 @@ class ProjectCard(QFrame):
         self.project_data = project_data
         self.is_admin = is_admin
         self.is_kitsu = bool(project_data.get("kitsu_id"))
-        self.setFixedSize(250, 200)
+        self.setFixedSize(250, 235)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
 
@@ -47,7 +47,7 @@ class ProjectCard(QFrame):
 
         self.thumb = QLabel()
         self.thumb.setObjectName("Thumb")
-        self.thumb.setFixedSize(220, 84)
+        self.thumb.setFixedSize(220, 124)  # 16:9
         self.thumb.setAlignment(Qt.AlignCenter)
         self.update_thumbnail()
         layout.addWidget(self.thumb)
@@ -69,7 +69,7 @@ class ProjectCard(QFrame):
         if not (thumb_path and os.path.exists(thumb_path)):
             thumb_path = get_placeholder_thumbnail()
         if thumb_path and os.path.exists(thumb_path):
-            pix = QPixmap(thumb_path).scaled(220, 100, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            pix = QPixmap(thumb_path).scaled(220, 124, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             self.thumb.setPixmap(pix)
         else:
             self.thumb.setText("NO THUMBNAIL")

@@ -23,7 +23,6 @@ class WorkspaceView(QWidget):
         # Per-session only — never persisted, so concurrent users on the same
         # project don't overwrite each other's "MY TASKS" filter.
         self.registry.current_user = self.auth.current_user["username"]
-        self.show_thumbs = True
         self.setup_ui()
 
     def setup_ui(self):
@@ -32,16 +31,6 @@ class WorkspaceView(QWidget):
         layout.setSpacing(0)
         self.header = Header(self.registry)
         layout.addWidget(self.header)
-        self.toolbar = QWidget()
-        self.toolbar.setStyleSheet("background-color: #1A1A1A; border-bottom: 1px solid #222;")
-        toolbar_layout = QHBoxLayout(self.toolbar)
-        toolbar_layout.setContentsMargins(30, 5, 30, 5)
-        self.thumb_toggle = QPushButton("HIDE THUMBNAILS")
-        self.thumb_toggle.setStyleSheet("color: #888; border: 1px solid #444; border-radius: 4px; padding: 5px 10px; font-size: 10px;")
-        self.thumb_toggle.clicked.connect(self.toggle_thumbnails)
-        toolbar_layout.addWidget(self.thumb_toggle)
-        toolbar_layout.addStretch()
-        layout.addWidget(self.toolbar)
         self.views = QStackedWidget()
         layout.addWidget(self.views)
         self.dashboard = Dashboard(self.registry)
@@ -58,14 +47,9 @@ class WorkspaceView(QWidget):
         self.dashboard.continue_work_requested.connect(self.on_continue_work)
         self.refresh_all()
 
-    def toggle_thumbnails(self):
-        self.show_thumbs = not self.show_thumbs
-        self.thumb_toggle.setText("SHOW THUMBNAILS" if not self.show_thumbs else "HIDE THUMBNAILS")
-        self.refresh_all()
-
     def refresh_all(self):
         is_admin = self.auth.is_admin()
-        self.dashboard.refresh(is_admin=is_admin, show_thumbs=self.show_thumbs)
+        self.dashboard.refresh(is_admin=is_admin)
         self.project_sheet.refresh(is_admin=is_admin)
 
     def switch_view(self, view):

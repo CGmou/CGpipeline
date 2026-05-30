@@ -136,7 +136,15 @@ class CGPipelineApp(QMainWindow):
         self.setCentralWidget(self.stack)
 
         settings = self.auth.settings
-        if settings.get("remember") and settings.get("last_user") and settings.get("last_pass"):
+        # Honour the LAST login method so a Kitsu session resumes as the Kitsu user
+        # (not the remembered local account).
+        if settings.get("last_login_method") == "kitsu":
+            if self._try_kitsu_autologin():
+                self.enter_app()
+            else:
+                # Don't silently fall back to a different local account.
+                self.show_login()
+        elif settings.get("remember") and settings.get("last_user") and settings.get("last_pass"):
             user = self.auth.login(settings["last_user"], settings["last_pass"], remember=True)
             if user:
                 self.enter_app()
@@ -144,6 +152,21 @@ class CGPipelineApp(QMainWindow):
                 self.show_login()
         else:
             self.show_login()
+
+    def _try_kitsu_autologin(self):
+        """Resume a remembered Kitsu session. Returns True on success."""
+        s = self.auth.settings
+        host, email, pw = s.get("kitsu_host", ""), s.get("kitsu_email", ""), s.get("kitsu_pass", "")
+        if not (s.get("kitsu_remember") and host and email and pw):
+            return False
+        try:
+            ok, _ = self.kitsu.connect(host, email, pw)
+        except Exception:
+            ok = False
+        if not ok:
+            return False
+        self.auth.login_with_kitsu(self.kitsu.email, self.kitsu.user_name, role=self.kitsu.pipeline_role())
+        return True
 
     def enter_app(self):
         """After login, go straight to the active project's workspace when launched
