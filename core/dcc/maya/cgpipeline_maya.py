@@ -970,6 +970,34 @@ def _deform_shapes_under(root):
     return out
 
 
+CACHE_SOURCE_GROUP = "CGP_CACHE_SOURCES"
+
+
+def _cache_source_group():
+    """Get (or create) the hidden container that holds all imported cache source
+    geometry, so the blendShape sources don't clutter the scene root."""
+    existing = cmds.ls("|" + CACHE_SOURCE_GROUP, long=True) or []
+    if existing:
+        return existing[0]
+    grp = cmds.group(empty=True, world=True, name=CACHE_SOURCE_GROUP)
+    grp = (cmds.ls(grp, long=True) or [grp])[0]
+    try:
+        cmds.setAttr(grp + ".visibility", 0)
+    except Exception:
+        pass
+    return grp
+
+
+def _cleanup_cache_source_group():
+    """Delete the cache-source container if it has been emptied."""
+    g = cmds.ls("|" + CACHE_SOURCE_GROUP, long=True) or []
+    if g and not (cmds.listRelatives(g[0], children=True, fullPath=True) or []):
+        try:
+            cmds.delete(g[0])
+        except Exception:
+            pass
+
+
 def _remove_cache_rig(grp_long):
     """Remove a previous CGPipeline cache application from a group so re-applying swaps
     cleanly: the tagged blendShape node(s) in the group's history, the hidden cache
@@ -982,10 +1010,11 @@ def _remove_cache_rig(grp_long):
                     cmds.delete(n)
             except Exception:
                 pass
-    for nr in (cmds.ls(assemblies=True, long=True) or []):
+    # Cache source geometry tagged for this group. It lives under the container, so
+    # find it by the tag attribute rather than scanning scene roots.
+    for nr in (cmds.ls("*.cgpCacheSource", objectsOnly=True, long=True) or []):
         try:
-            if cmds.attributeQuery("cgpCacheSource", node=nr, exists=True) and \
-                    cmds.getAttr(nr + ".cgpCacheSource") == grp_long:
+            if cmds.getAttr(nr + ".cgpCacheSource") == grp_long:
                 cmds.delete(nr)
         except Exception:
             pass
@@ -993,6 +1022,7 @@ def _remove_cache_rig(grp_long):
         _remove_existing_alembic(grp_long)
     except Exception:
         pass
+    _cleanup_cache_source_group()
 
 
 def _apply_alembic_to_group(cache_path, grp):
@@ -1063,16 +1093,29 @@ def _apply_alembic_to_group(cache_path, grp):
         cmds.warning(f"CGPipeline: Could not match cache meshes to {grp}; nothing applied.")
         return
 
-    # Keep the cache geometry (it drives the blendShapes) but hide + tag it for cleanup.
+    # Keep the cache geometry (it drives the blendShapes) but tuck it under one hidden,
+    # clearly-named container and rename + tag it, so it doesn't clutter the scene root.
+    container = _cache_source_group()
+    safe = grp.split("|")[-1].replace(":", "_")
     for nr in new_roots:
+        node = nr
         try:
-            cmds.setAttr(nr + ".visibility", 0)
-            if not cmds.attributeQuery("cgpCacheSource", node=nr, exists=True):
-                cmds.addAttr(nr, longName="cgpCacheSource", dataType="string")
-            cmds.setAttr(nr + ".cgpCacheSource", grp_long, type="string")
+            node = (cmds.parent(nr, container) or [nr])[0]
         except Exception:
             pass
-    print(f"CGPipeline: Cache applied to {grp} via blendShape ({count} mesh(es)); shaders untouched.")
+        try:
+            node = cmds.rename(node, f"CGP_cacheSrc_{safe}#")
+        except Exception:
+            pass
+        try:
+            cmds.setAttr(node + ".visibility", 0)
+            if not cmds.attributeQuery("cgpCacheSource", node=node, exists=True):
+                cmds.addAttr(node, longName="cgpCacheSource", dataType="string")
+            cmds.setAttr(node + ".cgpCacheSource", grp_long, type="string")
+        except Exception:
+            pass
+    print(f"CGPipeline: Cache applied to {grp} via blendShape ({count} mesh(es)); "
+          f"source tucked under {CACHE_SOURCE_GROUP}; shaders untouched.")
 
 
 def _apply_alembic_by_reconnect(cache_path, grp, grp_long):
