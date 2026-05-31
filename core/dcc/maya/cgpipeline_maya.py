@@ -379,6 +379,21 @@ def op_open_dashboard():
         cmds.warning(f"CGPipeline: Dashboard launch failed: {e}")
 
 
+def _safe_name(n):
+    """Filename-safe short name (drop namespace/DAG path, spaces)."""
+    return n.split("|")[-1].split(":")[-1].replace(" ", "_")
+
+
+def _master_dir():
+    """Folder for the *_master file. Assets keep it in the department folder (one
+    level above _wip); shots keep it inside the task (department) folder itself,
+    e.g. Shots/<shot>/Anim/<entity>_anim_master.ma."""
+    tp = os.path.normpath(STATE.task_path)
+    if os.path.basename(tp).lower() == "_wip":
+        return os.path.dirname(tp)
+    return tp
+
+
 def op_save():
     fp = cmds.file(q=True, sceneName=True)
     if not fp:
@@ -387,7 +402,7 @@ def op_save():
     cmds.file(save=True)
     if STATE.entity and STATE.task_path:
         master = f"{STATE.entity}_{TASK_ABBR.get(STATE.task_type, 'task')}_master.ma"
-        master_path = os.path.normpath(os.path.join(os.path.dirname(STATE.task_path), master))
+        master_path = os.path.normpath(os.path.join(_master_dir(), master))
         try:
             shutil.copy2(fp, master_path)
         except Exception as e:
@@ -406,7 +421,7 @@ def op_save_version():
         cmds.file(rename=fp)
         cmds.file(save=True, type="mayaAscii")
         master = f"{STATE.entity}_{TASK_ABBR.get(STATE.task_type, 'task')}_master.ma"
-        master_path = os.path.normpath(os.path.join(os.path.dirname(STATE.task_path), master))
+        master_path = os.path.normpath(os.path.join(_master_dir(), master))
         try:
             shutil.copy2(fp, master_path)
         except Exception as e:
@@ -627,35 +642,44 @@ def op_publish():
     if not STATE.publish_list:
         cmds.warning("CGPipeline: Publish list is empty.")
         return
-    pub = _resolve_publish_folder()
+    is_shot = STATE.category == "Shots"
+    # Shot caches go into the task's own cache folder, e.g. Shots/<shot>/Anim/cache.
+    # Asset publishes go to the asset's Publish folder.
+    if is_shot:
+        pub = os.path.join(STATE.task_path, "cache")
+    else:
+        pub = _resolve_publish_folder()
     if not pub:
-        cmds.warning("CGPipeline: Could not resolve Publish folder.")
+        cmds.warning("CGPipeline: Could not resolve publish folder.")
         return
     os.makedirs(pub, exist_ok=True)
     abbr = TASK_ABBR.get(STATE.task_type, "task")
     fmt = STATE.publish_format
-    ext_upper = fmt[1:].upper()
     s, e, is_anim = _frame_range()
+    rng = f"_f{s:04d}_f{e:04d}"
 
     if STATE.publish_separate:
         for obj in STATE.publish_list:
             if not cmds.objExists(obj):
                 continue
+            on = _safe_name(obj)
             is_cam = "cam" in obj.lower()
             if STATE.task_type == "Lookdev" and fmt in (".usd", ".ma"):
-                fn = f"{STATE.entity}_lkdev_{obj}{fmt}"
+                fn = f"{STATE.entity}_lkdev_{on}{fmt}"
             elif is_cam:
-                fn = f"{STATE.entity}_cam_f{s}_f{e}{fmt}"
-            elif STATE.category == "Shots":
-                fn = f"{STATE.entity}_{abbr}_{obj}_{ext_upper}{fmt}"
+                # <shot>_<obj>_cam_f0001_f0024.ext
+                fn = f"{STATE.entity}_{on}_cam{rng}{fmt}"
+            elif is_shot:
+                # <shot>_<obj>_<task>_f0001_f0024.ext  e.g. sh01_sq0010_woody_anim_f0001_f0024.abc
+                fn = f"{STATE.entity}_{on}_{abbr}{rng}{fmt}"
             else:
-                fn = f"{STATE.entity}_{abbr}_{obj}{fmt}"
+                fn = f"{STATE.entity}_{on}_{abbr}{fmt}"
             _export([obj], os.path.join(pub, fn), is_anim, s, e)
     else:
         if STATE.task_type == "Lookdev" and fmt in (".usd", ".ma"):
             fn = f"{STATE.entity}_lkdev{fmt}"
-        elif STATE.category == "Shots":
-            fn = f"{STATE.entity}_{abbr}_{ext_upper}{fmt}"
+        elif is_shot:
+            fn = f"{STATE.entity}_{abbr}{rng}{fmt}"
         else:
             fn = f"{STATE.entity}_{abbr}{fmt}"
         _export(list(STATE.publish_list), os.path.join(pub, fn), is_anim, s, e)
@@ -854,21 +878,25 @@ def op_assembly_scan():
                             "name": f, "path": os.path.join(pub, f), "asset_name": asset,
                         })
 
-    # 2. Caches under <shot_root>/<dept>/Publish
+    # 2. Caches under <shot_root>/<dept>/{cache,Publish} (and the dept folder itself).
     shot_root = _shot_root_from_task_path()
     if shot_root and os.path.isdir(shot_root):
         for dept in os.listdir(shot_root):
-            pub_dir = os.path.join(shot_root, dept, "Publish")
-            if not os.path.isdir(pub_dir):
+            dept_path = os.path.join(shot_root, dept)
+            if not os.path.isdir(dept_path):
                 continue
-            for f in os.listdir(pub_dir):
-                fl = f.lower()
-                if not fl.endswith((".abc", ".usd", ".usda", ".usdc", ".fbx")):
+            for sub in ("cache", "Publish", ""):
+                scan_dir = os.path.join(dept_path, sub) if sub else dept_path
+                if not os.path.isdir(scan_dir):
                     continue
-                if STATE.cache_anim_only and "_anim_" not in fl:
-                    continue
-                if not any(c["name"] == f for c in STATE.cache_items):
-                    STATE.cache_items.append({"name": f, "path": os.path.join(pub_dir, f)})
+                for f in os.listdir(scan_dir):
+                    fl = f.lower()
+                    if not fl.endswith((".abc", ".usd", ".usda", ".usdc", ".fbx")):
+                        continue
+                    if STATE.cache_anim_only and "_anim_" not in fl:
+                        continue
+                    if not any(c["name"] == f for c in STATE.cache_items):
+                        STATE.cache_items.append({"name": f, "path": os.path.join(scan_dir, f)})
 
     # 3. Sync collection_links to top-level assemblies in the scene (skip default cameras)
     existing = {l["name"]: (l["assigned_cache"], l["is_selected"]) for l in STATE.collection_links}
@@ -906,12 +934,21 @@ def op_assembly_apply(batch=False):
     for l in links:
         if not l["assigned_cache"]:
             continue
-        cache_path = None
-        for dept in os.listdir(shot_root):
-            test = os.path.normpath(os.path.join(shot_root, dept, "Publish", l["assigned_cache"]))
-            if os.path.exists(test):
-                cache_path = test
-                break
+        # Prefer the path resolved during scan; fall back to searching the dept's
+        # cache/Publish folders.
+        cache_path = next((c["path"] for c in STATE.cache_items
+                           if c["name"] == l["assigned_cache"]), None)
+        if not cache_path or not os.path.exists(cache_path):
+            cache_path = None
+            for dept in os.listdir(shot_root):
+                for sub in ("cache", "Publish", ""):
+                    base = os.path.join(shot_root, dept, sub) if sub else os.path.join(shot_root, dept)
+                    test = os.path.normpath(os.path.join(base, l["assigned_cache"]))
+                    if os.path.exists(test):
+                        cache_path = test
+                        break
+                if cache_path:
+                    break
         if not cache_path:
             print(f"CGPipeline: Cache not found: {l['assigned_cache']}")
             continue
