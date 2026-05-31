@@ -4,14 +4,16 @@ Mirrors core/dcc/blender/cgpipeline_blender.py:
   - Reads CGP_* env vars on startup, applies color management, loads plugins.
   - Polls maya_command.json so the dashboard can open tasks in this Maya session.
   - Adds a CGPipeline shelf and a panel: header (Open Dashboard, Save, Version Up,
-    Project/Task labels) + Publish and Assembly tabs.
+    Project/Task labels) + Publish, Assembly and Render tabs.
   - Operations: Save / Version Up / Publish (ABC/USD/FBX/MA, applies status +
     thumbnail) / Publish to Kitsu / Clean Up / Fix Missing Textures / Switch 2K-4K /
-    Import Model / Assembly scan / Reference Lookdev / Apply Caches.
+    Import Model / Assembly scan / Reference Lookdev / Apply Caches / Import Camera /
+    Render (batch render to Shots/<shot>/Render/<task>_v###).
 """
 
 import os
 import re
+import sys
 import json
 import time
 import atexit
@@ -77,6 +79,16 @@ class PipelineState:
     abc_write_visibility = False
     abc_write_uv_sets = True
     abc_step = 1.0
+
+    # Render
+    render_range_mode = "Frame Range"   # Single Frame / Frame Range / Custom
+    render_start = 1001
+    render_end = 1100
+    render_camera = ""
+    render_res_w = 1920
+    render_res_h = 1080
+    render_layer = ""
+    render_format = "exr"
 
     # Assembly
     lookdev_items = []      # [{name, path, asset_name}]
@@ -1181,6 +1193,318 @@ def op_cleanup_scene():
 
 
 # --------------------------------------------------------------------------------------
+# Operations: Camera cache import (assembly)
+# --------------------------------------------------------------------------------------
+_CAM_CACHE_RE = re.compile(r"_cam_f\d+_f\d+\.(abc|usd|usda|usdc|fbx)$", re.IGNORECASE)
+
+
+def _find_camera_caches():
+    """Published camera caches in the current shot — files named like
+    sh01_sq0010_cam_f1000_f1010.abc under any dept's cache/Publish folder. Newest first,
+    de-duplicated by file name."""
+    shot_root = _shot_root_from_task_path()
+    if not shot_root or not os.path.isdir(shot_root):
+        return []
+    found = []
+    for dept in os.listdir(shot_root):
+        dept_path = os.path.join(shot_root, dept)
+        if not os.path.isdir(dept_path):
+            continue
+        for sub in ("cache", "Publish", ""):
+            scan = os.path.join(dept_path, sub) if sub else dept_path
+            if not os.path.isdir(scan):
+                continue
+            for f in os.listdir(scan):
+                if _CAM_CACHE_RE.search(f):
+                    full = os.path.join(scan, f)
+                    try:
+                        found.append((full, os.path.getmtime(full)))
+                    except Exception:
+                        found.append((full, 0))
+    found.sort(key=lambda x: x[1], reverse=True)
+    seen, out = set(), []
+    for p, _ in found:
+        b = os.path.basename(p)
+        if b not in seen:
+            seen.add(b)
+            out.append(p)
+    return out
+
+
+def op_import_camera():
+    """Auto-detect the shot's published camera cache and import it. Imports the newest
+    when several exist."""
+    cams = _find_camera_caches()
+    if not cams:
+        cmds.warning("CGPipeline: No camera cache found in this shot "
+                     "(looking for *_cam_f####_f####).")
+        return
+    chosen = cams[0]
+    ext = os.path.splitext(chosen)[1].lower()
+    fwd = chosen.replace("\\", "/")
+    try:
+        if ext == ".abc":
+            cmds.AbcImport(fwd, mode="import")
+        elif ext in (".usd", ".usda", ".usdc"):
+            cmds.mayaUSDImport(file=fwd)
+        elif ext == ".fbx":
+            mel.eval(f'FBXImport -f "{fwd}";')
+        else:
+            cmds.warning(f"CGPipeline: Unsupported camera cache format: {ext}")
+            return
+        print(f"CGPipeline: Imported camera → {chosen}")
+        cmds.confirmDialog(title="Import Camera",
+                           message=f"Imported camera:\n{os.path.basename(chosen)}")
+    except Exception as e:
+        cmds.warning(f"CGPipeline: Camera import failed: {e}")
+
+
+# --------------------------------------------------------------------------------------
+# Operations: Render
+# --------------------------------------------------------------------------------------
+def _entity_root():
+    """Root folder of the current entity — the shot root for shots, the asset root
+    (Assets/<cat>/<asset>) for assets. None when it can't be derived."""
+    sr = _shot_root_from_task_path()
+    if sr:
+        return sr
+    if STATE.task_path:
+        parts = os.path.normpath(STATE.task_path).replace("\\", "/").split("/")
+        if "Assets" in parts:
+            i = parts.index("Assets")
+            if len(parts) >= i + 3:
+                return os.path.normpath("/".join(parts[:i + 3]))
+    return None
+
+
+def _shot_frame_range():
+    """The shot's project-sheet frame range (frame_start/frame_end on the registry task
+    for this entity), or None if unset."""
+    if not STATE.reg_path or not os.path.exists(STATE.reg_path) or not STATE.entity:
+        return None
+    try:
+        with open(STATE.reg_path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    for t in data.get("tasks", []):
+        if t.get("name") == STATE.entity and \
+                t.get("frame_start") is not None and t.get("frame_end") is not None:
+            try:
+                return int(t["frame_start"]), int(t["frame_end"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _current_work_version():
+    """Version number parsed from the open scene's filename (…_v003.ma → 3), else 1."""
+    try:
+        scene = cmds.file(q=True, sceneName=True) or ""
+    except Exception:
+        scene = ""
+    m = re.search(r"_v(\d+)\.", os.path.basename(scene))
+    return int(m.group(1)) if m else 1
+
+
+def _render_output_dir():
+    """<entity_root>/Render/<entity>_<abbr>_v###  — renders are versioned per work file."""
+    root = _entity_root()
+    if not root:
+        return None
+    abbr = TASK_ABBR.get(STATE.task_type, "task")
+    ver = _current_work_version()
+    name = f"{STATE.entity or 'render'}_{abbr}_v{ver:03d}"
+    return os.path.normpath(os.path.join(root, "Render", name))
+
+
+def _resolve_render_range():
+    mode = STATE.render_range_mode
+    if mode == "Single Frame":
+        try:
+            f = int(cmds.currentTime(q=True))
+        except Exception:
+            f = STATE.render_start
+        return f, f
+    if mode == "Frame Range":
+        rng = _shot_frame_range()
+        if rng:
+            return rng
+    return int(STATE.render_start), int(STATE.render_end)
+
+
+def _set_renderable_camera(cam):
+    """Make `cam` (transform or shape) the only renderable camera."""
+    target = None
+    if cmds.objExists(cam):
+        if cmds.nodeType(cam) == "camera":
+            target = (cmds.ls(cam, long=True) or [cam])[0]
+        else:
+            shapes = cmds.listRelatives(cam, shapes=True, type="camera", fullPath=True) or []
+            target = shapes[0] if shapes else None
+    for c in (cmds.ls(type="camera", long=True) or []):
+        try:
+            cmds.setAttr(c + ".renderable", 1 if c == target else 0)
+        except Exception:
+            pass
+
+
+# Maya defaultRenderGlobals.imageFormat enum values, and Arnold aiTranslator names.
+_IMAGE_FORMAT_ENUM = {"exr": 51, "png": 32, "tif": 3, "tiff": 3,
+                      "jpg": 8, "jpeg": 8, "tga": 19, "iff": 7}
+_ARNOLD_FORMAT = {"exr": "exr", "png": "png", "tif": "tif", "tiff": "tif",
+                  "jpg": "jpeg", "jpeg": "jpeg"}
+
+
+def _set_image_format(ext):
+    ext = ext.lower().lstrip(".")
+    if cmds.objExists("defaultArnoldDriver") and ext in _ARNOLD_FORMAT:
+        try:
+            cmds.setAttr("defaultArnoldDriver.aiTranslator", _ARNOLD_FORMAT[ext], type="string")
+        except Exception:
+            pass
+    if ext in _IMAGE_FORMAT_ENUM:
+        try:
+            cmds.setAttr("defaultRenderGlobals.imageFormat", _IMAGE_FORMAT_ENUM[ext])
+        except Exception:
+            pass
+
+
+def _apply_render_settings():
+    """Push the Render-tab settings onto the render globals and point the output at
+    <entity_root>/Render/<task>_v###. Returns (render_dir, start, end)."""
+    s, e = _resolve_render_range()
+    # Resolution
+    try:
+        cmds.setAttr("defaultResolution.width", int(STATE.render_res_w))
+        cmds.setAttr("defaultResolution.height", int(STATE.render_res_h))
+        cmds.setAttr("defaultResolution.deviceAspectRatio",
+                     float(STATE.render_res_w) / float(STATE.render_res_h))
+        cmds.setAttr("defaultResolution.pixelAspect", 1.0)
+    except Exception:
+        pass
+    # Frame range + naming → <RenderLayer>/<RenderLayer>.<entity>.####.ext
+    try:
+        cmds.setAttr("defaultRenderGlobals.animation", 1 if s != e else 0)
+        cmds.setAttr("defaultRenderGlobals.startFrame", s)
+        cmds.setAttr("defaultRenderGlobals.endFrame", e)
+        cmds.setAttr("defaultRenderGlobals.byFrameStep", 1)
+        cmds.setAttr("defaultRenderGlobals.extensionPadding", 4)
+        cmds.setAttr("defaultRenderGlobals.outFormatControl", 0)
+        cmds.setAttr("defaultRenderGlobals.putFrameBeforeExt", 1)
+        cmds.setAttr("defaultRenderGlobals.periodInExt", 1)   # name.#.ext
+    except Exception:
+        pass
+    prefix = f"<RenderLayer>/<RenderLayer>.{STATE.entity or 'render'}"
+    try:
+        cmds.setAttr("defaultRenderGlobals.imageFilePrefix", prefix, type="string")
+    except Exception:
+        pass
+    if STATE.render_camera:
+        _set_renderable_camera(STATE.render_camera)
+    _set_image_format(STATE.render_format)
+    # Output directory → the versioned Render folder. Set as the session 'images' rule
+    # (not persisted) so a Maya-UI render lands there too; the batch render also gets it
+    # explicitly via -rd.
+    rdir = _render_output_dir()
+    if rdir:
+        try:
+            os.makedirs(rdir, exist_ok=True)
+            cmds.workspace(fileRule=["images", rdir])
+        except Exception as ex:
+            print(f"CGPipeline: Could not set render image dir: {ex}")
+    return rdir, s, e
+
+
+def _layer_for_cmd(layer):
+    """Translate the UI layer name to what the Render command expects."""
+    return "defaultRenderLayer" if layer in ("", "masterLayer", "defaultRenderLayer") else layer
+
+
+def _find_render_exe():
+    """The standalone Render(.exe) that ships next to maya(.exe)."""
+    name = "Render.exe" if os.name == "nt" else "Render"
+    cand = os.path.join(os.path.dirname(sys.executable), name)
+    if os.path.exists(cand):
+        return cand
+    return shutil.which("Render")
+
+
+def op_render():
+    """Apply the Render-tab settings, save the scene, and launch a standalone batch
+    render into <entity_root>/Render/<task>_v###. Uses the scene's own renderer (-r file)
+    with the tab's frame range / camera / layer / resolution as overrides."""
+    rdir, s, e = _apply_render_settings()
+    fp = cmds.file(q=True, sceneName=True)
+    if not fp:
+        cmds.warning("CGPipeline: Save the scene first (Version Up) before rendering.")
+        return
+    try:
+        cmds.file(save=True)
+    except Exception as ex:
+        print(f"CGPipeline: Could not save before render: {ex}")
+
+    render_exe = _find_render_exe()
+    if not render_exe:
+        cmds.confirmDialog(
+            title="Render",
+            message=("Render settings applied and output set to:\n"
+                     f"{rdir}\n\nThe standalone Render executable wasn't found, so start a "
+                     "Batch Render from Maya (Render menu) to write the frames."))
+        return
+
+    cmd = [render_exe, "-r", "file", "-s", str(s), "-e", str(e)]
+    cmd += ["-rl", _layer_for_cmd(STATE.render_layer)]
+    if STATE.render_camera and cmds.objExists(STATE.render_camera):
+        cmd += ["-cam", STATE.render_camera]
+    cmd += ["-x", str(int(STATE.render_res_w)), "-y", str(int(STATE.render_res_h))]
+    if rdir:
+        cmd += ["-rd", rdir]
+    cmd += ["-im", f"<RenderLayer>/<RenderLayer>.{STATE.entity or 'render'}"]
+    if STATE.reg_path:
+        cmd += ["-proj", os.path.dirname(STATE.reg_path)]
+    cmd += [fp]
+    try:
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        subprocess.Popen(cmd, creationflags=creationflags)
+        print("CGPipeline: Batch render launched: " + " ".join(cmd))
+        cmds.confirmDialog(
+            title="Render",
+            message=(f"Batch render started → {rdir}\n\n"
+                     f"Frames {s}-{e}, layer '{STATE.render_layer or 'masterLayer'}', "
+                     f"{STATE.render_res_w}x{STATE.render_res_h}, .{STATE.render_format}."))
+    except Exception as e2:
+        cmds.warning(f"CGPipeline: Could not launch batch render: {e2}")
+
+
+def _scene_cameras():
+    """Renderable scene cameras (transforms), default cameras last."""
+    out, defaults = [], []
+    for shp in (cmds.ls(type="camera", long=True) or []):
+        par = (cmds.listRelatives(shp, parent=True, fullPath=True) or [None])[0]
+        if not par:
+            continue
+        short = par.split("|")[-1]
+        if short in _DEFAULT_CAMERAS:
+            defaults.append(short)
+        else:
+            out.append(short)
+    return out + defaults
+
+
+def _scene_render_layers():
+    """Render layer names for the picker — 'masterLayer' plus any user render layers
+    (including Render Setup's rs_<name> nodes, whose names are what -rl expects)."""
+    layers = ["masterLayer"]
+    for rl in (cmds.ls(type="renderLayer") or []):
+        if rl == "defaultRenderLayer":
+            continue
+        if rl not in layers:
+            layers.append(rl)
+    return layers
+
+
+# --------------------------------------------------------------------------------------
 # Operations: Import Model (asset-context setup for lookdev / rig / texture tasks)
 # --------------------------------------------------------------------------------------
 def _find_asset_publish_dir():
@@ -1798,6 +2122,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         outer.addWidget(tabs, 1)
         tabs.addTab(self._make_publish_tab(), "Publish")
         tabs.addTab(self._make_assembly_tab(), "Assembly")
+        tabs.addTab(self._make_render_tab(), "Render")
 
     # ---- tabs ----
     def _add_lookdev_section(self, v):
@@ -1891,21 +2216,23 @@ class CGPipelinePanel(QtWidgets.QWidget):
             "Export the entire scene — no need to add anything to the list below.")
         self.whole_scene_chk.toggled.connect(self._on_whole_scene_changed)
         opts.addWidget(self.whole_scene_chk)
-        v.addLayout(opts)
-
-        # Additional export settings + master-file control.
-        opts2 = QtWidgets.QHBoxLayout()
-        add_btn = self._btn("Additional…", self._open_additional_dialog)
-        add_btn.setToolTip("Alembic export options: UV Write, World Space, Write "
-                           "Visibility, Write UV Sets, and Step.")
-        opts2.addWidget(add_btn)
         self.master_chk = QtWidgets.QCheckBox("Update Master File")
         self.master_chk.setChecked(STATE.update_master)
         self.master_chk.setToolTip(
             "When on, Save / Version Up / Publish also refresh the entity's *_master file. "
             "Turn off to keep an existing master while you work on a different version.")
         self.master_chk.toggled.connect(lambda c: setattr(STATE, "update_master", c))
-        opts2.addWidget(self.master_chk)
+        opts.addWidget(self.master_chk)
+        opts.addStretch()
+        v.addLayout(opts)
+
+        # Additional Alembic export settings.
+        opts2 = QtWidgets.QHBoxLayout()
+        add_btn = self._btn("Additional…", self._open_additional_dialog)
+        add_btn.setToolTip("Alembic export options: UV Write, World Space, Write "
+                           "Visibility, Write UV Sets, and Step.")
+        opts2.addWidget(add_btn)
+        opts2.addStretch()
         v.addLayout(opts2)
 
         v.addWidget(QtWidgets.QLabel("Selection List:"))
@@ -1989,6 +2316,12 @@ class CGPipelinePanel(QtWidgets.QWidget):
         arow.addWidget(self._btn("APPLY ALL", lambda: self._apply_caches(True)))
         arow.addWidget(self._btn("CLEAR ALL", self._clear_cache_checks))
         cv.addLayout(arow)
+
+        # Auto-detect and import the shot's published camera cache.
+        cam_btn = self._btn("IMPORT CAM", op_import_camera)
+        cam_btn.setToolTip("Find this shot's published camera cache "
+                           "(…_cam_f####_f####) and import the newest one.")
+        cv.addWidget(cam_btn)
         cv.addWidget(self._sep())
         v.addWidget(self.cache_section)
 
@@ -2025,6 +2358,162 @@ class CGPipelinePanel(QtWidgets.QWidget):
         cache-assign and lookdev-reference lists."""
         self._refresh_model_list()
         self._on_assembly_scan()
+
+    # ---- Render tab ----
+    def _make_render_tab(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setColumnStretch(1, 1)
+        r = 0
+
+        # Frame range mode.
+        grid.addWidget(QtWidgets.QLabel("Frame Range:"), r, 0)
+        self.render_range_combo = QtWidgets.QComboBox()
+        self.render_range_combo.addItems(["Single Frame", "Frame Range", "Custom"])
+        self.render_range_combo.setCurrentText(STATE.render_range_mode)
+        self.render_range_combo.currentTextChanged.connect(self._on_render_range_changed)
+        grid.addWidget(self.render_range_combo, r, 1)
+        r += 1
+
+        # Custom start/end (enabled only for Custom).
+        grid.addWidget(QtWidgets.QLabel("Start / End:"), r, 0)
+        frow = QtWidgets.QHBoxLayout()
+        self.render_start_spin = QtWidgets.QSpinBox()
+        self.render_start_spin.setRange(-100000, 100000)
+        self.render_start_spin.setValue(STATE.render_start)
+        self.render_start_spin.valueChanged.connect(lambda x: setattr(STATE, "render_start", x))
+        self.render_end_spin = QtWidgets.QSpinBox()
+        self.render_end_spin.setRange(-100000, 100000)
+        self.render_end_spin.setValue(STATE.render_end)
+        self.render_end_spin.valueChanged.connect(lambda x: setattr(STATE, "render_end", x))
+        frow.addWidget(self.render_start_spin)
+        frow.addWidget(self.render_end_spin)
+        fwrap = QtWidgets.QWidget()
+        fwrap.setLayout(frow)
+        frow.setContentsMargins(0, 0, 0, 0)
+        grid.addWidget(fwrap, r, 1)
+        r += 1
+
+        # Camera.
+        grid.addWidget(QtWidgets.QLabel("Camera:"), r, 0)
+        self.render_cam_combo = QtWidgets.QComboBox()
+        self.render_cam_combo.currentTextChanged.connect(
+            lambda t: setattr(STATE, "render_camera", t))
+        grid.addWidget(self.render_cam_combo, r, 1)
+        r += 1
+
+        # Resolution.
+        grid.addWidget(QtWidgets.QLabel("Resolution:"), r, 0)
+        resrow = QtWidgets.QHBoxLayout()
+        resrow.setContentsMargins(0, 0, 0, 0)
+        self.render_w_spin = QtWidgets.QSpinBox()
+        self.render_w_spin.setRange(1, 100000)
+        self.render_w_spin.setValue(STATE.render_res_w)
+        self.render_w_spin.valueChanged.connect(lambda x: setattr(STATE, "render_res_w", x))
+        self.render_h_spin = QtWidgets.QSpinBox()
+        self.render_h_spin.setRange(1, 100000)
+        self.render_h_spin.setValue(STATE.render_res_h)
+        self.render_h_spin.valueChanged.connect(lambda x: setattr(STATE, "render_res_h", x))
+        resrow.addWidget(self.render_w_spin)
+        resrow.addWidget(QtWidgets.QLabel("x"))
+        resrow.addWidget(self.render_h_spin)
+        reswrap = QtWidgets.QWidget()
+        reswrap.setLayout(resrow)
+        grid.addWidget(reswrap, r, 1)
+        r += 1
+
+        # Render layer.
+        grid.addWidget(QtWidgets.QLabel("Render Layer:"), r, 0)
+        self.render_layer_combo = QtWidgets.QComboBox()
+        self.render_layer_combo.currentTextChanged.connect(
+            lambda t: setattr(STATE, "render_layer", t))
+        grid.addWidget(self.render_layer_combo, r, 1)
+        r += 1
+
+        # Format.
+        grid.addWidget(QtWidgets.QLabel("Format:"), r, 0)
+        self.render_format_combo = QtWidgets.QComboBox()
+        self.render_format_combo.addItems(["exr", "png", "tif", "jpg", "tga"])
+        self.render_format_combo.setCurrentText(STATE.render_format)
+        self.render_format_combo.currentTextChanged.connect(
+            lambda t: setattr(STATE, "render_format", t))
+        grid.addWidget(self.render_format_combo, r, 1)
+        r += 1
+
+        v.addLayout(grid)
+
+        hdr = QtWidgets.QHBoxLayout()
+        hdr.addStretch()
+        hdr.addWidget(self._btn("Refresh", self._refresh_render_lists))
+        v.addLayout(hdr)
+
+        self.render_out_label = QtWidgets.QLabel("")
+        self.render_out_label.setWordWrap(True)
+        self.render_out_label.setStyleSheet("color: #888888; font-size: 11px;")
+        v.addWidget(self.render_out_label)
+
+        v.addStretch()
+        render_btn = self._btn("RENDER", op_render)
+        render_btn.setStyleSheet(
+            "font-weight: bold; padding: 8px; background-color: #A72828; color: #ffffff;")
+        v.addWidget(render_btn)
+
+        self._refresh_render_lists()
+        self._on_render_range_changed(STATE.render_range_mode)
+        return self._wrap_scroll(w)
+
+    def _on_render_range_changed(self, mode):
+        STATE.render_range_mode = mode
+        custom = mode == "Custom"
+        self.render_start_spin.setEnabled(custom)
+        self.render_end_spin.setEnabled(custom)
+        # Reflect the shot's project-sheet range in the spinboxes for "Frame Range".
+        if mode == "Frame Range":
+            rng = _shot_frame_range()
+            if rng:
+                self.render_start_spin.blockSignals(True)
+                self.render_end_spin.blockSignals(True)
+                self.render_start_spin.setValue(rng[0])
+                self.render_end_spin.setValue(rng[1])
+                self.render_start_spin.blockSignals(False)
+                self.render_end_spin.blockSignals(False)
+                STATE.render_start, STATE.render_end = rng
+
+    def _refresh_render_lists(self):
+        """Repopulate the camera + render-layer dropdowns and seed the frame range from
+        the shot's project-sheet range."""
+        cams = _scene_cameras()
+        self.render_cam_combo.blockSignals(True)
+        self.render_cam_combo.clear()
+        self.render_cam_combo.addItems(cams)
+        if STATE.render_camera in cams:
+            self.render_cam_combo.setCurrentText(STATE.render_camera)
+        elif cams:
+            STATE.render_camera = self.render_cam_combo.currentText()
+        self.render_cam_combo.blockSignals(False)
+
+        layers = _scene_render_layers()
+        self.render_layer_combo.blockSignals(True)
+        self.render_layer_combo.clear()
+        self.render_layer_combo.addItems(layers)
+        if STATE.render_layer in layers:
+            self.render_layer_combo.setCurrentText(STATE.render_layer)
+        else:
+            STATE.render_layer = self.render_layer_combo.currentText()
+        self.render_layer_combo.blockSignals(False)
+
+        rng = _shot_frame_range()
+        if rng and STATE.render_range_mode == "Frame Range":
+            self.render_start_spin.setValue(rng[0])
+            self.render_end_spin.setValue(rng[1])
+            STATE.render_start, STATE.render_end = rng
+
+        out = _render_output_dir()
+        self.render_out_label.setText(f"Output: {out}" if out else "Output: (no task context)")
 
     def _clear_cache_checks(self):
         """Untick every cache in the Assign-Lookdev list."""
@@ -2075,6 +2564,10 @@ class CGPipelinePanel(QtWidgets.QWidget):
         _ensure_task_context_from_scene()
         try:
             self._refresh_model_list()
+        except Exception:
+            pass
+        try:
+            self._refresh_render_lists()
         except Exception:
             pass
         if STATE.task_path or STATE.reg_path:
