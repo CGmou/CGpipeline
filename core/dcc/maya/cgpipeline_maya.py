@@ -658,28 +658,32 @@ def op_publish():
     s, e, is_anim = _frame_range()
     rng = f"_f{s:04d}_f{e:04d}"
 
-    if STATE.publish_separate:
+    if is_shot:
+        # Shot caches are ALWAYS one file per selected object/group, named with the
+        # object, so the assembly can assign each one:
+        #   <shot>_<object>_<task>_f0001_f0024.ext  (e.g. sh01_sq0010_woody_anim_f0001_f0024.abc)
         for obj in STATE.publish_list:
             if not cmds.objExists(obj):
                 continue
             on = _safe_name(obj)
-            is_cam = "cam" in obj.lower()
+            if "cam" in obj.lower():
+                fn = f"{STATE.entity}_{on}_cam{rng}{fmt}"
+            else:
+                fn = f"{STATE.entity}_{on}_{abbr}{rng}{fmt}"
+            _export([obj], os.path.join(pub, fn), is_anim, s, e)
+    elif STATE.publish_separate:
+        for obj in STATE.publish_list:
+            if not cmds.objExists(obj):
+                continue
+            on = _safe_name(obj)
             if STATE.task_type == "Lookdev" and fmt in (".usd", ".ma"):
                 fn = f"{STATE.entity}_lkdev_{on}{fmt}"
-            elif is_cam:
-                # <shot>_<obj>_cam_f0001_f0024.ext
-                fn = f"{STATE.entity}_{on}_cam{rng}{fmt}"
-            elif is_shot:
-                # <shot>_<obj>_<task>_f0001_f0024.ext  e.g. sh01_sq0010_woody_anim_f0001_f0024.abc
-                fn = f"{STATE.entity}_{on}_{abbr}{rng}{fmt}"
             else:
                 fn = f"{STATE.entity}_{on}_{abbr}{fmt}"
             _export([obj], os.path.join(pub, fn), is_anim, s, e)
     else:
         if STATE.task_type == "Lookdev" and fmt in (".usd", ".ma"):
             fn = f"{STATE.entity}_lkdev{fmt}"
-        elif is_shot:
-            fn = f"{STATE.entity}_{abbr}{rng}{fmt}"
         else:
             fn = f"{STATE.entity}_{abbr}{fmt}"
         _export(list(STATE.publish_list), os.path.join(pub, fn), is_anim, s, e)
@@ -959,8 +963,16 @@ def op_assembly_apply(batch=False):
         ext = os.path.splitext(cache_path)[1].lower()
         try:
             if ext == ".abc":
-                # Connect by hierarchy onto the target group.
-                cmds.AbcImport(cache_path, mode="import", connect="/" + grp)
+                # Equivalent of Cache > Alembic Cache > Import Alembic with
+                # "File Content: Merge, Import under current selection": select the
+                # target group, then AbcImport with connect='merge' so the cache
+                # attaches to the matching geometry under the selection instead of
+                # creating a new, disconnected hierarchy.
+                try:
+                    cmds.select(grp, replace=True)
+                except Exception:
+                    pass
+                cmds.AbcImport(cache_path, mode="import", connect="merge")
             elif ext in (".usd", ".usda", ".usdc"):
                 cmds.mayaUSDImport(file=cache_path)
             elif ext == ".fbx":
