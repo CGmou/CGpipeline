@@ -911,18 +911,66 @@ def _remove_imported_cache_by_tag(cache_tag):
             pass
 
 
+# Outliner organisation: category groups for renderable assembly geometry, and one
+# hidden group for the lookdev material-source references used for shader transfer.
+LOOKDEV_SHD_GROUP = "_LOOKDEV_SHD_"
+CATEGORY_GROUP_MAP = {
+    "char": "_CHAR_", "character": "_CHAR_", "characters": "_CHAR_",
+    "set": "_SETS_", "sets": "_SETS_", "setdress": "_SETS_",
+    "prop": "_PROPS_", "props": "_PROPS_",
+    "env": "_ENV_", "environment": "_ENV_", "environments": "_ENV_",
+    "veh": "_VEH_", "vehicle": "_VEH_", "vehicles": "_VEH_",
+}
+
+
+def _category_group_name(category):
+    key = (category or "").strip().lower()
+    if key in CATEGORY_GROUP_MAP:
+        return CATEGORY_GROUP_MAP[key]
+    return "_" + (category or "MISC").strip().upper().replace(" ", "_") + "_"
+
+
+def _get_or_make_group(name, hidden=False):
+    """Get (or create) a top-level empty group called `name`."""
+    existing = cmds.ls("|" + name, long=True) or []
+    if existing:
+        return existing[0]
+    g = (cmds.ls(cmds.group(empty=True, world=True, name=name), long=True) or [name])[0]
+    if hidden:
+        try:
+            cmds.setAttr(g + ".visibility", 0)
+        except Exception:
+            pass
+    return g
+
+
+def _parent_under(node, group):
+    """Reparent `node` under `group`, relative (no world compensation, so animated /
+    connected transforms aren't disturbed — the groups are at the origin). Returns the
+    node's resolved path after the move."""
+    try:
+        moved = cmds.parent(node, group, relative=True) or [node]
+        return (cmds.ls(moved[0], long=True) or [moved[0]])[0]
+    except Exception:
+        return node
+
+
 def _ensure_lookdev_referenced(lookdev_item):
     """Reference the lookdev ONCE as a shared material source, reusing it if already
-    present. Uses a dedicated 'MTL_<asset>' namespace (kept separate from a direct
-    'Reference Lookdev into Scene' which uses the plain asset namespace), and the
-    geometry is hidden — it only provides materials; the animated caches render.
-    Returns the lookdev's top group DAG paths (shader source), or [] on failure."""
+    present. Uses a dedicated 'MTL_<asset>' namespace and parents the (hidden) geometry
+    under the _LOOKDEV_SHD_ group so it's easy to read in the outliner; it only provides
+    materials, the animated caches render. Returns the lookdev's top group DAG paths."""
     asset = lookdev_item.get("asset_name") or "lkdev"
     ns = "MTL_" + asset
 
     def _roots():
-        return [t for t in (cmds.ls(assemblies=True, long=True) or [])
-                if t.split("|")[-1].startswith(ns + ":")]
+        out = []
+        for n in (cmds.ls(ns + ":*", long=True, type="transform") or []):
+            p = (cmds.listRelatives(n, parent=True, fullPath=True) or [None])[0]
+            pleaf = p.split("|")[-1] if p else ""
+            if not pleaf.startswith(ns + ":"):
+                out.append(n)
+        return out
 
     roots = _roots()
     if roots:
@@ -934,26 +982,36 @@ def _ensure_lookdev_referenced(lookdev_item):
     except Exception as e:
         cmds.warning(f"CGPipeline: Lookdev reference failed: {e}")
         return []
-    roots = _roots()
-    for r in roots:
+    shd = _get_or_make_group(LOOKDEV_SHD_GROUP, hidden=True)
+    out = []
+    for r in _roots():
+        r2 = _parent_under(r, shd)
         try:
-            cmds.setAttr(r + ".visibility", 0)   # hide material source; caches render
+            cmds.setAttr(r2 + ".visibility", 0)   # hide material source; caches render
         except Exception:
             pass
-    return roots
+        out.append(r2)
+    return out
 
 
 def op_reference_lookdev(lookdev_item):
     """Reference a lookdev into the scene as VISIBLE geometry — for assets that are NOT
     driven by an animation cache (sets, props, or any asset to keep as-is). Allows
-    multiple instances (Maya auto-numbers the namespace)."""
+    multiple instances (Maya auto-numbers the namespace). The result is parented under
+    the asset's category group (_CHAR_/_SETS_/_PROPS_…)."""
     ns = lookdev_item.get("asset_name") or "lkdev"
+    before = set(cmds.ls(assemblies=True, long=True) or [])
     try:
         cmds.file(lookdev_item["path"], reference=True, namespace=ns,
                   mergeNamespacesOnClash=False, ignoreVersion=True)
-        print(f"CGPipeline: Referenced lookdev '{ns}' into scene.")
     except Exception as e:
         cmds.warning(f"CGPipeline: Reference failed: {e}")
+        return
+    cat_grp = _get_or_make_group(_category_group_name(lookdev_item.get("category")))
+    for r in (set(cmds.ls(assemblies=True, long=True) or []) - before):
+        _parent_under(r, cat_grp)
+    print(f"CGPipeline: Referenced lookdev '{ns}' into scene "
+          f"({_category_group_name(lookdev_item.get('category'))}).")
 
 
 _CACHE_NAME_RE = re.compile(
@@ -969,12 +1027,13 @@ def _is_object_cache(name):
     return bool(m) and "_" in m.group(1)
 
 
-def _import_cache_and_shade(cache_path, lookdev_roots):
+def _import_cache_and_shade(cache_path, lookdev_roots, category=""):
     """Import the alembic cache as its own geometry and copy the lookdev's shaders onto
     it (whole-object AND per-face). `lookdev_roots` are the referenced lookdev groups
     used purely as the material source. Topology / UVs / names match, so per-face
-    assignments transfer exactly. The cache import is tagged with its file name so a
-    re-apply replaces it. Returns True on success."""
+    assignments transfer exactly. The imported cache is parented under its category
+    group (_CHAR_/_SETS_/…) and tagged with its file name so a re-apply replaces it.
+    Returns True on success."""
     cache_fwd = cache_path.replace("\\", "/")
     cache_tag = os.path.basename(cache_path)
 
@@ -1000,16 +1059,18 @@ def _import_cache_and_shade(cache_path, lookdev_roots):
         cmds.warning(f"CGPipeline: Cache produced no geometry: {cache_tag}.")
         return False
 
+    cat_grp = _get_or_make_group(_category_group_name(category)) if category else None
     transferred = 0
     for nr in new_roots:
         for sh in _mesh_shapes(nr):
             src = look_map.get(_rel_key(sh, nr))
             if src and _transfer_shading(src, sh):
                 transferred += 1
+        node = _parent_under(nr, cat_grp) if cat_grp else nr
         try:
-            if not cmds.attributeQuery("cgpCacheImport", node=nr, exists=True):
-                cmds.addAttr(nr, longName="cgpCacheImport", dataType="string")
-            cmds.setAttr(nr + ".cgpCacheImport", cache_tag, type="string")
+            if not cmds.attributeQuery("cgpCacheImport", node=node, exists=True):
+                cmds.addAttr(node, longName="cgpCacheImport", dataType="string")
+            cmds.setAttr(node + ".cgpCacheImport", cache_tag, type="string")
         except Exception:
             pass
 
@@ -1086,7 +1147,8 @@ def op_assembly_scan():
                     fl = f.lower()
                     if "_lkdev" in fl and fl.endswith((".ma", ".mb", ".usd", ".usda", ".usdc")):
                         STATE.lookdev_items.append({
-                            "name": f, "path": os.path.join(pub, f), "asset_name": asset,
+                            "name": f, "path": os.path.join(pub, f),
+                            "asset_name": asset, "category": cat,
                         })
 
     # 2. Caches under <shot_root>/<dept>/{cache,Publish} (and the dept folder itself).
@@ -1157,7 +1219,7 @@ def op_assembly_apply(batch=False):
         if not lookdev_roots:
             print(f"CGPipeline: Could not reference lookdev '{lookdev_name}'.")
             continue
-        _import_cache_and_shade(cache_path, lookdev_roots)
+        _import_cache_and_shade(cache_path, lookdev_roots, lookdev_item.get("category", ""))
 
 
 # --------------------------------------------------------------------------------------
@@ -1365,9 +1427,10 @@ class CGPipelinePanel(QtWidgets.QWidget):
         # that isn't driven by an animation cache).
         v.addWidget(self._sep())
         v.addWidget(self._section("Reference Lookdev into Scene"))
-        self.lookdev_ref_list = QtWidgets.QListWidget()
-        self.lookdev_ref_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        v.addWidget(self.lookdev_ref_list, 1)
+        self.lookdev_ref_tree = QtWidgets.QTreeWidget()
+        self.lookdev_ref_tree.setHeaderHidden(True)
+        self.lookdev_ref_tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        v.addWidget(self.lookdev_ref_tree, 1)
         v.addWidget(self._btn("REFERENCE SELECTED", self._on_reference_lookdev))
 
         v.addWidget(self._sep())
@@ -1467,23 +1530,32 @@ class CGPipelinePanel(QtWidgets.QWidget):
             self.cache_tree.addTopLevelItem(item)
         for c in range(3):
             self.cache_tree.resizeColumnToContents(c)
-        # Lookdev assets available to reference directly into the scene.
-        self.lookdev_ref_list.clear()
-        seen = set()
+        # Lookdev assets available to reference directly into the scene, grouped by
+        # category (Character / Sets / Props / …) for easier reading.
+        self.lookdev_ref_tree.clear()
+        by_cat, seen = {}, set()
         for it in STATE.lookdev_items:
             a = it.get("asset_name") or ""
-            if a and a not in seen:
-                seen.add(a)
-                self.lookdev_ref_list.addItem(a)
+            if not a or a in seen:
+                continue
+            seen.add(a)
+            by_cat.setdefault(it.get("category") or "Misc", []).append(a)
+        for cat in sorted(by_cat):
+            top = QtWidgets.QTreeWidgetItem([cat])
+            top.setFlags(QtCore.Qt.ItemIsEnabled)   # category header: not selectable
+            self.lookdev_ref_tree.addTopLevelItem(top)
+            for a in sorted(by_cat[cat]):
+                top.addChild(QtWidgets.QTreeWidgetItem([a]))
+            top.setExpanded(True)
 
     def _on_reference_lookdev(self):
-        rows = self.lookdev_ref_list.selectedItems()
-        if not rows:
-            cmds.warning("CGPipeline: Select a lookdev to reference.")
+        # Only leaf items (assets) are selectable; ignore category headers.
+        assets = [w.text(0) for w in self.lookdev_ref_tree.selectedItems() if w.childCount() == 0]
+        if not assets:
+            cmds.warning("CGPipeline: Select a lookdev asset to reference.")
             return
-        for w in rows:
-            asset = w.text()
-            it = next((x for x in STATE.lookdev_items if x.get("asset_name") == asset), None)
+        for a in assets:
+            it = next((x for x in STATE.lookdev_items if x.get("asset_name") == a), None)
             if it:
                 op_reference_lookdev(it)
 
