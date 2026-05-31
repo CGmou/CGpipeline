@@ -11,6 +11,7 @@ class ProjectCard(QFrame):
     modify_requested = Signal(dict)
     delete_requested = Signal(dict)
     upload_requested = Signal(dict)
+    hide_requested = Signal(dict)
 
     def __init__(self, project_data, is_admin=False):
         super().__init__()
@@ -97,6 +98,10 @@ class ProjectCard(QFrame):
                 upload_action.triggered.connect(lambda: self.upload_requested.emit(self.project_data))
                 menu.addAction(upload_action)
 
+            hide_action = QAction("Unhide Project" if self.project_data.get("hidden") else "Hide Project", self)
+            hide_action.triggered.connect(lambda: self.hide_requested.emit(self.project_data))
+            menu.addAction(hide_action)
+
             menu.addSeparator()
             delete_action = QAction("Delete Project", self)
             delete_action.triggered.connect(lambda: self.delete_requested.emit(self.project_data))
@@ -124,6 +129,7 @@ class ProjectHubView(QWidget):
             from core.kitsu import KitsuManager
             kitsu = KitsuManager()
         self.kitsu = kitsu
+        self.show_hidden = False
         self.setup_ui()
 
     def setup_ui(self):
@@ -146,6 +152,14 @@ class ProjectHubView(QWidget):
         header.addWidget(self.refresh_btn)
 
         if self.auth.is_admin():
+            self.show_hidden_btn = QPushButton("SHOW HIDDEN")
+            self.show_hidden_btn.setStyleSheet("""
+                QPushButton { background-color: #333; color: #888; border: 1px solid #444; border-radius: 4px; padding: 10px 15px; font-size: 11px; font-weight: bold; }
+                QPushButton:hover { background-color: #444; color: white; }
+            """)
+            self.show_hidden_btn.clicked.connect(self.toggle_show_hidden)
+            header.addWidget(self.show_hidden_btn)
+
             self.user_mgr_btn = QPushButton("USERS")
             self.user_mgr_btn.setStyleSheet("""
                 QPushButton { background-color: #444; color: white; border: none; border-radius: 4px; padding: 10px 20px; font-weight: bold; }
@@ -227,6 +241,10 @@ class ProjectHubView(QWidget):
             assigned = set((self.auth.current_user or {}).get("projects", []))
             projects = [p for p in projects if p.get("id") in assigned]
 
+        # Hide hidden projects unless an admin has toggled "Show Hidden".
+        if not (self.auth.is_admin() and self.show_hidden):
+            projects = [p for p in projects if not p.get("hidden")]
+
         if projects:
             for index, project in enumerate(projects):
                 card = ProjectCard(project, is_admin=self.auth.is_admin())
@@ -235,6 +253,13 @@ class ProjectHubView(QWidget):
                     card.modify_requested.connect(self.on_modify_project)
                     card.delete_requested.connect(self.on_delete_project)
                     card.upload_requested.connect(self.on_upload_to_kitsu)
+                    card.hide_requested.connect(self.on_hide_project)
+                # Dim hidden cards (only visible to admins via "Show Hidden").
+                if project.get("hidden"):
+                    from PySide6.QtWidgets import QGraphicsOpacityEffect
+                    eff = QGraphicsOpacityEffect(card)
+                    eff.setOpacity(0.45)
+                    card.setGraphicsEffect(eff)
                 self.grid.addWidget(card, index // 4, index % 4)
         else:
             # Placeholder when the root is set but there's nothing to show.
@@ -244,6 +269,16 @@ class ProjectHubView(QWidget):
                 placeholder = QLabel(text)
                 placeholder.setStyleSheet("color: #555; font-size: 14px; margin-top: 20px;")
                 self.grid.addWidget(placeholder, 0, 0)
+
+    def toggle_show_hidden(self):
+        self.show_hidden = not self.show_hidden
+        self.show_hidden_btn.setText("HIDE HIDDEN" if self.show_hidden else "SHOW HIDDEN")
+        self.refresh()
+
+    def on_hide_project(self, project_data):
+        new_hidden = not project_data.get("hidden")
+        self.hub.update_project(project_data["id"], hidden=new_hidden)
+        self.refresh()
 
     def on_open_user_mgmt(self):
         dialog = UserManagementDialog(self.auth, self)
