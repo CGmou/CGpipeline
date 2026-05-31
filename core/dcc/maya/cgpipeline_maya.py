@@ -958,68 +958,77 @@ def _restore_shading(data):
 
 
 def _apply_alembic_to_group(cache_path, grp):
-    """Apply an Alembic cache onto a group's EXISTING meshes, scoped to THIS group so
-    shading groups / per-face materials are preserved — the result of Maya's
+    """Merge an Alembic cache onto a group's EXISTING meshes like Maya's
     'Cache > Alembic Cache > Import Cache > Merge'.
 
-    Two paths:
-      * Single instance  -> AbcImport -connect binds the AlembicNode straight onto the
-        existing shapes (shaders untouched).
-      * Duplicated instances (woody:CH_Woody AND woody1:CH_Woody) -> -connect matches
-        the cache's names GLOBALLY and would drive every copy with the same cache, so
-        instead we import once, reconnect ONLY this group's meshes (by
-        namespace-stripped path), delete the temp geometry, and restore this group's
-        shading afterwards."""
+    Referenced lookdev puts each instance in its own namespace (woody:CH_Woody,
+    woody1:CH_Woody) while the cache root is unqualified (CH_Woody). Passing a
+    namespaced/absolute name to AbcImport -connect matches the cache's names GLOBALLY
+    (every CH_Woody), which cross-wires the copies and breaks shaders. Instead we set
+    the CURRENT NAMESPACE to this instance's namespace and connect by the BARE node
+    name, so the connect resolves CH_Woody -> woody1:CH_Woody only. The AlembicNode
+    then drives the existing shaded shapes in place, so per-face materials survive.
+    Falls back to a per-instance reconnect (+ shading restore) only if it can't bind."""
     grp_long = (cmds.ls(grp, long=True) or [grp])[0]
     cache_fwd = cache_path.replace("\\", "/")
+    leaf = grp_long.split("|")[-1]          # 'woody1:CH_Woody'  (or 'CH_Woody')
+    ns = leaf.rpartition(":")[0]            # 'woody1'           ('' when not referenced)
+    node_name = leaf.split(":")[-1]         # 'CH_Woody'
+
     meshes = cmds.listRelatives(grp_long, allDescendents=True, type="mesh", fullPath=True) or []
     if not meshes:
         cmds.warning(f"CGPipeline: No meshes under {grp} to receive the cache.")
         return
 
-    # Capture the group's shading UP FRONT so we can reassert it no matter how the
-    # cache import disturbs per-face material assignments. This makes shader survival
-    # independent of which apply path runs below.
+    # Safety net: capture per-face shading so it can be reasserted if a fallback path
+    # strips it.
     shading = _capture_shading(meshes)
     n_assign = sum(len(a) for _, a in shading)
     print(f"CGPipeline: Captured shading for {len(shading)} shape(s), {n_assign} assignment(s) on {grp}.")
 
-    # NOTE: auto-removal of existing AlembicNode(s) is disabled for now (experiment) —
-    # deleting the node before applying appears to break shaders on a second identical
-    # model. Trade-off while this is off: re-applying may stack AlembicNodes.
+    # NOTE: auto-removal of existing AlembicNode(s) stays disabled from the previous
+    # experiment. Re-applying a cache may stack nodes until it's re-enabled.
     # _remove_existing_alembic(grp_long)
 
-    applied = False
-    # Single, unambiguous instance: the native merge binds onto the existing shapes.
-    if not _has_duplicate_instances(grp_long):
-        before = set(cmds.ls(assemblies=True, long=True) or [])
+    before = set(cmds.ls(assemblies=True, long=True) or [])
+    prev_ns = cmds.namespaceInfo(currentNamespace=True) or ":"
+    try:
+        # Scope name resolution to THIS instance's namespace so the connect binds the
+        # cache to woody1:CH_Woody only — not every CH_Woody in the scene.
+        if ns:
+            mel.eval(f'namespace -set ":{ns}";')
+        cmds.select(grp_long, replace=True)
+        mel.eval(f'AbcImport -mode "import" -connect "{node_name}" "{cache_fwd}"')
+    except Exception as e:
+        cmds.warning(f"CGPipeline: Namespaced merge failed for {grp}: {e}")
+    finally:
         try:
-            cmds.select(grp_long, replace=True)
-            connect_name = (cmds.ls(selection=True) or [grp])[0]
-            mel.eval(f'AbcImport -mode "import" -connect "{connect_name}" "{cache_fwd}"')
-        except Exception as e:
-            cmds.warning(f"CGPipeline: Native merge failed for {grp}: {e}")
-        if _alembic_nodes_under(grp_long):
-            stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before - {grp_long})
-            if stray:
-                try: cmds.delete(stray)
-                except Exception: pass
-            print(f"CGPipeline: Cache merged onto {grp} (Native Merge).")
-            applied = True
-        else:
-            # Didn't bind: clean up whatever it imported, then fall through to reconnect.
-            stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
-            if stray:
-                try: cmds.delete(stray)
-                except Exception: pass
+            restore_ns = prev_ns if prev_ns.startswith(":") else ":" + prev_ns
+            mel.eval(f'namespace -set "{restore_ns}";')
+        except Exception:
+            pass
 
-    # Duplicated instance, or native merge didn't bind: scoped per-instance reconnect
-    # (imports once, wires ONLY this group's meshes, deletes the temp geometry).
+    applied = False
+    if _alembic_nodes_under(grp_long):
+        # Bound to this instance. Remove anything it imported that did NOT bind.
+        stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before - {grp_long})
+        if stray:
+            try: cmds.delete(stray)
+            except Exception: pass
+        print(f"CGPipeline: Cache merged onto {grp} (namespace '{ns or ':'}').")
+        applied = True
+    else:
+        # Didn't bind: remove whatever was imported, then fall back to reconnect.
+        stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
+        if stray:
+            try: cmds.delete(stray)
+            except Exception: pass
+
     if not applied:
         _apply_alembic_by_reconnect(cache_fwd, grp, grp_long)
 
-    # Reassert the captured shading. A no-op if nothing was disturbed (e.g. a clean
-    # native merge); the safety net when the .inMesh rewire stripped per-face shaders.
+    # Reassert the captured shading. A no-op after a clean namespaced merge; the safety
+    # net if the reconnect fallback stripped per-face shaders.
     if shading:
         restored = _restore_shading(shading)
         if restored:
