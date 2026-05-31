@@ -850,35 +850,6 @@ def _group_match_token(grp_name):
     return grp_name.split("|")[-1].split(":")[-1]
 
 
-def _alembic_nodes_under(grp):
-    """AlembicNode(s) currently in the history of the meshes under `grp`."""
-    try:
-        meshes = cmds.listRelatives(grp, allDescendents=True, type="mesh", fullPath=True) or []
-    except Exception:
-        meshes = []
-    nodes = set()
-    for m in meshes:
-        for n in (cmds.listHistory(m) or []):
-            try:
-                if cmds.nodeType(n) == "AlembicNode":
-                    nodes.add(n)
-            except Exception:
-                continue
-    return nodes
-
-
-def _remove_existing_alembic(grp):
-    """Delete any AlembicNode(s) already driving the meshes under `grp`, so applying
-    a cache replaces the previous one instead of stacking (which bogs Maya down)."""
-    nodes = _alembic_nodes_under(grp)
-    if nodes:
-        try:
-            cmds.delete(list(nodes))
-            print(f"CGPipeline: Removed {len(nodes)} old Alembic node(s) on {grp}")
-        except Exception as e:
-            print(f"CGPipeline: Could not remove old Alembic nodes on {grp}: {e}")
-
-
 def _rel_key(full_path, root_long):
     """Namespace-stripped node names below `root_long`, as a tuple. Used to match a
     cache mesh to the corresponding mesh under a target group regardless of
@@ -890,215 +861,129 @@ def _rel_key(full_path, root_long):
     return tuple(p.split(":")[-1] for p in sub.split("|") if p)
 
 
-def _has_duplicate_instances(grp_long):
-    """True when another node in the scene shares this group's namespace-stripped
-    name — i.e. the same asset is referenced more than once (woody:CH_Woody AND
-    woody1:CH_Woody). AbcImport -connect matches cache names globally and can't tell
-    those apart, so the caller must scope the apply manually."""
-    leaf = grp_long.split("|")[-1].split(":")[-1]
-    if not leaf:
-        return False
-    count = 0
-    for t in (cmds.ls(type="transform", long=True) or []):
-        if t.split("|")[-1].split(":")[-1] == leaf:
-            count += 1
-            if count > 1:
-                return True
-    return False
-
-
-def _capture_shading(meshes):
-    """Record, per shape, the (shadingEngine, [its own members]) assignments so they
-    can be restored after a cache import disturbs them. Members are filtered to the
-    shape (and its transform) so other objects sharing the material are never touched.
-    Handles both whole-object and per-face assignments."""
-    data = []
-    for sh in meshes:
-        sh_long = (cmds.ls(sh, long=True) or [sh])[0]
-        parent = (cmds.listRelatives(sh, parent=True, fullPath=True) or [None])[0]
-        own = {sh_long, parent} - {None}
-        assigns = []
-        for sg in dict.fromkeys(cmds.listConnections(sh, type="shadingEngine") or []):
-            mine = []
-            for m in (cmds.sets(sg, q=True) or []):
-                node = m.split(".")[0]
-                node_long = cmds.ls(node, long=True) or []
-                if node_long and node_long[0] in own:
-                    mine.append(m)
-            if mine:
-                assigns.append((sg, mine))
-        if assigns:
-            data.append((sh_long, assigns))
-    return data
-
-
-def _restore_shading(data):
-    """Re-assign each captured (shadingEngine, members) pair. Best-effort and never
-    raises. Returns the number of shapes whose shading was reasserted."""
-    touched = 0
-    for sh_long, assigns in data:
-        if not cmds.objExists(sh_long):
-            continue
-        ok = False
-        for sg, members in assigns:
-            members = [m for m in members if cmds.objExists(m.split(".")[0])]
-            if not members:
+def _mesh_shapes(root):
+    """Non-intermediate mesh shapes under `root` (full DAG paths)."""
+    out = []
+    for m in (cmds.listRelatives(root, allDescendents=True, type="mesh", fullPath=True) or []):
+        try:
+            if cmds.getAttr(m + ".intermediateObject"):
                 continue
-            try:
-                # forceElement assigns the components to the shading group. It must
-                # NOT be combined with edit=True (that errors), which previously made
-                # this silently no-op and left the per-face shaders broken.
-                cmds.sets(members, forceElement=sg)
-                ok = True
-            except Exception as e:
-                print(f"CGPipeline: shading restore failed for {sg}: {e}")
-        if ok:
-            touched += 1
-    return touched
+        except Exception:
+            pass
+        out.append(m)
+    return out
 
 
-def _reference_of(node):
-    """Return the reference node owning `node`, or None if it isn't from a reference."""
+def _transfer_shading(src_shape, dst_shape):
+    """Copy the shading-group assignment from src_shape onto dst_shape — both whole-
+    object and per-face. Assumes identical topology (same face indices), so the face
+    component lists transfer directly. dst is fresh cache geometry, so we just assign
+    it to the source's shading groups. Returns True if anything was assigned."""
+    src_long = (cmds.ls(src_shape, long=True) or [src_shape])[0]
+    src_parent = (cmds.listRelatives(src_shape, parent=True, fullPath=True) or [None])[0]
+    own = {src_long, src_parent} - {None}
+    assigned = False
+    for sg in dict.fromkeys(cmds.listConnections(src_shape, type="shadingEngine") or []):
+        comps, whole = [], False
+        for m in (cmds.sets(sg, q=True) or []):
+            node = m.split(".")[0]
+            node_long = cmds.ls(node, long=True) or []
+            if not (node_long and node_long[0] in own):
+                continue
+            if "." in m:
+                comps.append(m.split(".", 1)[1])   # e.g. 'f[0:50]'
+            else:
+                whole = True
+        try:
+            if comps:
+                cmds.sets([dst_shape + "." + c for c in comps], forceElement=sg)
+                assigned = True
+            elif whole:
+                cmds.sets(dst_shape, forceElement=sg)
+                assigned = True
+        except Exception as e:
+            print(f"CGPipeline: shading transfer failed for {sg}: {e}")
+    return assigned
+
+
+def _remove_imported_cache(grp_long):
+    """Remove a previously imported cache for this group (tagged cgpCacheImport) and
+    un-hide the lookdev geometry, so re-applying swaps cleanly."""
+    for nr in (cmds.ls("*.cgpCacheImport", objectsOnly=True, long=True) or []):
+        try:
+            if cmds.getAttr(nr + ".cgpCacheImport") == grp_long:
+                cmds.delete(nr)
+        except Exception:
+            pass
     try:
-        if cmds.referenceQuery(node, isNodeReferenced=True):
-            return cmds.referenceQuery(node, referenceNode=True)
+        cmds.setAttr(grp_long + ".visibility", 1)
     except Exception:
         pass
-    return None
-
-
-def _duplicate_instance_refs(grp_long):
-    """Reference node(s) of OTHER scene instances that share this group's
-    namespace-stripped name (the same asset referenced more than once). AbcImport
-    -connect matches the cache name on ALL of them, so they get unloaded while we
-    connect THIS instance, then reloaded."""
-    bare = grp_long.split("|")[-1].split(":")[-1]
-    my_ref = _reference_of(grp_long)
-    refs = []
-    for t in (cmds.ls(type="transform", long=True) or []):
-        if t == grp_long:
-            continue
-        if t.split("|")[-1].split(":")[-1] != bare:
-            continue
-        r = _reference_of(t)
-        if r and r != my_ref and r not in refs:
-            refs.append(r)
-    return refs
 
 
 def _apply_alembic_to_group(cache_path, grp):
-    """Merge an Alembic cache onto a group's EXISTING meshes like Maya's
-    'Cache > Alembic Cache > Import Cache > Merge': AbcImport -connect wires the
-    AlembicNode straight onto the existing shaded shapes. No extra geometry is left in
-    the scene and the per-face materials are preserved (this is the shader-safe native
-    merge that already works for a single character).
+    """Apply an Alembic cache by IMPORTING it as its own geometry and copying the
+    lookdev's shaders onto it — instead of forcing the cache onto the lookdev shape
+    (which kept breaking the per-face shader link).
 
-    -connect matches the cache's node names GLOBALLY, so with the same lookdev
-    referenced twice (woody:CH_Woody, woody1:CH_Woody) it would drive both and break
-    them. To bind ONE instance we temporarily UNLOAD the other identical reference(s)
-    for the duration of the connect, then reload them — their own edits (including a
-    previously applied cache) are restored on reload."""
+    The referenced lookdev is the shader source: for each imported cache shape we copy
+    the matching lookdev shape's shading-group assignment (whole-object AND per-face)
+    onto it. Topology / UVs / names match, so per-face assignments transfer exactly,
+    and because we copy from THIS group's lookdev only, duplicated characters
+    (woody:/woody1:) never cross-wire. The lookdev geometry is then hidden so the
+    animated, shaded cache is what shows; the reference stays loaded as the material
+    source. Multiple caches can be imported side by side (CH_Woody, CH_Woody1, ...)."""
     grp_long = (cmds.ls(grp, long=True) or [grp])[0]
     cache_fwd = cache_path.replace("\\", "/")
-    node_name = grp_long.split("|")[-1].split(":")[-1]      # bare 'CH_Woody'
 
-    if not (cmds.listRelatives(grp_long, allDescendents=True, type="mesh", fullPath=True) or []):
-        cmds.warning(f"CGPipeline: No meshes under {grp} to receive the cache.")
+    look_map = {}
+    for sh in _mesh_shapes(grp_long):
+        look_map.setdefault(_rel_key(sh, grp_long), sh)
+    if not look_map:
+        cmds.warning(f"CGPipeline: No lookdev meshes under {grp} to source shaders from.")
         return
 
-    # Re-apply cleanly: drop any previous AlembicNode driving this group first.
-    _remove_existing_alembic(grp_long)
+    # Clean re-apply: remove a previously imported cache for this group.
+    _remove_imported_cache(grp_long)
 
-    # Isolate this instance so the global -connect can only bind here.
-    unloaded = []
-    for r in _duplicate_instance_refs(grp_long):
-        try:
-            if cmds.referenceQuery(r, isLoaded=True):
-                cmds.file(unloadReference=r)
-                unloaded.append(r)
-        except Exception:
-            pass
-
+    # Import the cache as its own geometry (its own AlembicNode drives the animation).
     before = set(cmds.ls(assemblies=True, long=True) or [])
     try:
-        cmds.select(grp_long, replace=True)
-        mel.eval(f'AbcImport -mode "import" -connect "{node_name}" "{cache_fwd}"')
+        cmds.AbcImport(cache_fwd, mode="import")
     except Exception as e:
-        cmds.warning(f"CGPipeline: Cache merge failed for {grp}: {e}")
-    finally:
-        for r in unloaded:
-            try:
-                cmds.file(loadReference=r)
-            except Exception:
-                pass
-
-    if _alembic_nodes_under(grp_long):
-        # Bound to this instance. Remove any geometry the connect imported but didn't bind.
-        for s in (set(cmds.ls(assemblies=True, long=True) or []) - before - {grp_long}):
-            try: cmds.delete(s)
-            except Exception: pass
-        print(f"CGPipeline: Cache merged onto {grp}.")
-        return
-
-    # Didn't bind: remove whatever was imported, then fall back to the per-instance
-    # reconnect (with shading capture/restore) so the cache is still applied.
-    for s in (set(cmds.ls(assemblies=True, long=True) or []) - before):
-        try: cmds.delete(s)
-        except Exception: pass
-    meshes = cmds.listRelatives(grp_long, allDescendents=True, type="mesh", fullPath=True) or []
-    shading = _capture_shading(meshes)
-    _apply_alembic_by_reconnect(cache_fwd, grp, grp_long)
-    if shading:
-        _restore_shading(shading)
-
-
-def _apply_alembic_by_reconnect(cache_path, grp, grp_long):
-    """Fallback for namespaced/duplicated instances, where the global -connect merge
-    can't disambiguate which instance to bind. Imports the cache fresh, rewires its
-    AlembicNode outputs onto the target group's matching meshes (by namespace-stripped
-    path), then deletes the temporary geometry."""
-    tgt_map = {}
-    for tm in (cmds.listRelatives(grp_long, allDescendents=True, type="mesh", fullPath=True) or []):
-        tgt_map[_rel_key(tm, grp_long)] = tm
-    if not tgt_map:
-        cmds.warning(f"CGPipeline: No meshes under {grp} to receive the cache.")
-        return
-
-    before = set(cmds.ls(assemblies=True, long=True) or [])
-    try:
-        cmds.AbcImport(cache_path, mode="import")
-    except Exception as e:
-        cmds.warning(f"CGPipeline: AbcImport failed: {e}")
+        cmds.warning(f"CGPipeline: AbcImport failed for {grp}: {e}")
         return
     new_roots = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
     if not new_roots:
-        cmds.warning("CGPipeline: Cache produced no new geometry to connect.")
+        cmds.warning(f"CGPipeline: Cache produced no geometry for {grp}.")
         return
 
-    reconnected = 0
+    # Copy lookdev shaders onto the imported cache shapes (matched by stripped path).
+    transferred = 0
     for nr in new_roots:
-        for nm in (cmds.listRelatives(nr, allDescendents=True, type="mesh", fullPath=True) or []):
-            tgt = tgt_map.get(_rel_key(nm, nr))
-            if not tgt:
-                continue
-            src = cmds.listConnections(nm + ".inMesh", plugs=True, source=True, destination=False) or []
-            if not src:
-                continue
-            try:
-                cmds.connectAttr(src[0], tgt + ".inMesh", force=True)
-                reconnected += 1
-            except Exception:
-                pass
+        for sh in _mesh_shapes(nr):
+            src = look_map.get(_rel_key(sh, nr))
+            if src and _transfer_shading(src, sh):
+                transferred += 1
+        # Tag the import so re-applying can clean it up.
+        try:
+            if not cmds.attributeQuery("cgpCacheImport", node=nr, exists=True):
+                cmds.addAttr(nr, longName="cgpCacheImport", dataType="string")
+            cmds.setAttr(nr + ".cgpCacheImport", grp_long, type="string")
+        except Exception:
+            pass
 
-    if reconnected:
-        for nr in new_roots:
-            try:
-                cmds.delete(nr)  # remove temp geometry; the AlembicNode now drives the target
-            except Exception:
-                pass
-        print(f"CGPipeline: Cache applied to {grp} ({reconnected} meshes, per-instance reconnect).")
+    # Hide the lookdev geometry so the animated, shaded cache is what's visible; the
+    # reference stays loaded as the material source.
+    try:
+        cmds.setAttr(grp_long + ".visibility", 0)
+    except Exception:
+        pass
+
+    if transferred:
+        print(f"CGPipeline: Imported cache for {grp}; copied shaders to {transferred} shape(s).")
     else:
-        cmds.warning(f"CGPipeline: Could not match cache meshes to {grp}; imported cache kept as-is.")
+        cmds.warning(f"CGPipeline: Imported cache for {grp} but matched no shapes to copy shaders onto.")
 
 
 def _shot_root_from_task_path():
