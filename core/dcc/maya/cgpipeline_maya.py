@@ -590,7 +590,9 @@ def _export(items, filepath, is_anim, s, e):
 
     if fmt == ".abc":
         root_args = "".join(f" -root {r}" for r in roots)
-        job = f'-frameRange {s} {e} -uvWrite -worldSpace -dataFormat ogawa{root_args} -file "{fp}"'
+        # -uvWrite writes the current UV set; -writeUVSets writes all UV sets.
+        job = (f'-frameRange {s} {e} -uvWrite -writeUVSets -worldSpace '
+               f'-dataFormat ogawa{root_args} -file "{fp}"')
         try:
             cmds.AbcExport(j=job)
         except Exception as ex:
@@ -963,16 +965,16 @@ def op_assembly_apply(batch=False):
         ext = os.path.splitext(cache_path)[1].lower()
         try:
             if ext == ".abc":
-                # Equivalent of Cache > Alembic Cache > Import Alembic with
-                # "File Content: Merge, Import under current selection": select the
-                # target group, then AbcImport with connect='merge' so the cache
-                # attaches to the matching geometry under the selection instead of
-                # creating a new, disconnected hierarchy.
+                # Cache > Alembic Cache > Import Cache (merge under current selection):
+                # select the target group and pass its DAG root path(s) to -connect so
+                # AbcImport attaches the cache to the matching geometry UNDER the
+                # selection (by name) instead of creating a new disconnected hierarchy.
                 try:
                     cmds.select(grp, replace=True)
                 except Exception:
                     pass
-                cmds.AbcImport(cache_path, mode="import", connect="merge")
+                roots = cmds.ls(selection=True, long=True) or [grp]
+                cmds.AbcImport(cache_path, mode="import", connect=" ".join(roots))
             elif ext in (".usd", ".usda", ".usdc"):
                 cmds.mayaUSDImport(file=cache_path)
             elif ext == ".fbx":
