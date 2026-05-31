@@ -169,24 +169,39 @@ class CGPipelineApp(QMainWindow):
         return True
 
     def enter_app(self):
-        """After login, go straight to the active project's workspace when launched
-        from a DCC (env carries CGP_REGISTRY_PATH); otherwise show the project hub."""
+        """After login: open the DCC's project when launched from a DCC, otherwise
+        reopen the last project the user was working on so they don't have to find it
+        again. Falls back to the project hub (already shown) when there's nothing valid
+        to reopen."""
         self.show_hub()
+        # Launched from a DCC: open that project's workspace.
         dcc_reg = os.environ.get("CGP_REGISTRY_PATH", "")
         in_dcc = os.environ.get("CGP_IN_DCC", "")
         if in_dcc and dcc_reg and os.path.exists(dcc_reg):
-            project_path = os.path.normpath(os.path.dirname(dcc_reg))
+            self._open_project_by_path(os.path.normpath(os.path.dirname(dcc_reg)))
+            return
+        # Normal launch: jump straight back to the last project worked on.
+        last = (self.auth.settings.get("active_project_path") or "").strip()
+        if last and os.path.exists(os.path.join(last, "registry.json")):
+            self._open_project_by_path(os.path.normpath(last))
+
+    def _open_project_by_path(self, project_path):
+        """Open the workspace for the project at `project_path`. Uses the matching hub
+        entry (to carry its settings, e.g. color management) when available, otherwise
+        builds a minimal entry. Stays on the hub if the project no longer exists."""
+        if not os.path.isdir(project_path):
+            return
+        project = None
+        try:
+            for p in self.hub.projects:
+                if os.path.normpath(p.get("path", "")) == project_path:
+                    project = p
+                    break
+        except Exception:
             project = None
-            try:
-                for p in self.hub.projects:
-                    if os.path.normpath(p.get("path", "")) == project_path:
-                        project = p
-                        break
-            except Exception:
-                project = None
-            if not project:
-                project = {"path": project_path, "name": os.path.basename(project_path)}
-            self.on_project_selected(project)
+        if not project:
+            project = {"path": project_path, "name": os.path.basename(project_path)}
+        self.on_project_selected(project)
 
     def closeEvent(self, event):
         if hasattr(self, 'lock_file') and os.path.exists(self.lock_file):
