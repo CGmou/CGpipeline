@@ -66,8 +66,17 @@ class PipelineState:
     end_frame = 1100
     publish_separate = False
     include_materials = True
+    publish_whole_scene = False    # export everything; ignore the selection list
+    update_master = True           # also refresh the *_master file on save / publish
     publish_notes = ""       # comment sent to Kitsu on "Publish to Kitsu"
     publish_status = "NO CHANGE"   # status applied when publishing (no manual button)
+
+    # Alembic "Additional…" export settings (mirror Maya's AbcExport flags).
+    abc_uv_write = True
+    abc_world_space = True
+    abc_write_visibility = False
+    abc_write_uv_sets = True
+    abc_step = 1.0
 
     # Assembly
     lookdev_items = []      # [{name, path, asset_name}]
@@ -446,19 +455,27 @@ def _master_dir():
     return tp
 
 
+def _copy_to_master(fp):
+    """Copy the working file `fp` over the entity's *_master.ma. Gated by the
+    "Update Master File" toggle so the user controls which version becomes the master."""
+    if not (STATE.update_master and fp and STATE.entity and STATE.task_path):
+        return
+    master = f"{STATE.entity}_{TASK_ABBR.get(STATE.task_type, 'task')}_master.ma"
+    master_path = os.path.normpath(os.path.join(_master_dir(), master))
+    try:
+        shutil.copy2(fp, master_path)
+        print(f"CGPipeline: Master updated → {master_path}")
+    except Exception as e:
+        print(f"CGPipeline: Master copy failed: {e}")
+
+
 def op_save():
     fp = cmds.file(q=True, sceneName=True)
     if not fp:
         cmds.warning("CGPipeline: Scene has no name yet — use Version Up.")
         return
     cmds.file(save=True)
-    if STATE.entity and STATE.task_path:
-        master = f"{STATE.entity}_{TASK_ABBR.get(STATE.task_type, 'task')}_master.ma"
-        master_path = os.path.normpath(os.path.join(_master_dir(), master))
-        try:
-            shutil.copy2(fp, master_path)
-        except Exception as e:
-            print(f"CGPipeline: Master copy failed: {e}")
+    _copy_to_master(fp)
 
 
 def op_save_version():
@@ -472,12 +489,7 @@ def op_save_version():
         os.makedirs(STATE.task_path, exist_ok=True)
         cmds.file(rename=fp)
         cmds.file(save=True, type="mayaAscii")
-        master = f"{STATE.entity}_{TASK_ABBR.get(STATE.task_type, 'task')}_master.ma"
-        master_path = os.path.normpath(os.path.join(_master_dir(), master))
-        try:
-            shutil.copy2(fp, master_path)
-        except Exception as e:
-            print(f"CGPipeline: Master copy failed: {e}")
+        _copy_to_master(fp)
         print(f"CGPipeline: Saved v{v:03d}")
     except Exception as e:
         cmds.warning(f"CGPipeline: Version save failed: {e}")
@@ -672,8 +684,19 @@ def _export(items, filepath, is_anim, s, e):
 
     if fmt == ".abc":
         root_args = "".join(f" -root {r}" for r in roots)
-        # -uvWrite writes the current UV set; -writeUVSets writes all UV sets.
-        job = (f'-frameRange {s} {e} -uvWrite -writeUVSets -worldSpace '
+        # Flags come from the "Additional…" dialog. -uvWrite writes the current UV set;
+        # -writeUVSets writes all UV sets; -step sets the frame sampling stride.
+        flags = []
+        if STATE.abc_uv_write:
+            flags.append("-uvWrite")
+        if STATE.abc_write_uv_sets:
+            flags.append("-writeUVSets")
+        if STATE.abc_world_space:
+            flags.append("-worldSpace")
+        if STATE.abc_write_visibility:
+            flags.append("-writeVisibility")
+        step = STATE.abc_step if STATE.abc_step and STATE.abc_step > 0 else 1.0
+        job = (f'-frameRange {s} {e} -step {step} {" ".join(flags)} '
                f'-dataFormat ogawa{root_args} -file "{fp}"')
         try:
             cmds.AbcExport(j=job)
@@ -722,10 +745,29 @@ def _export(items, filepath, is_anim, s, e):
     return True
 
 
+_DEFAULT_CAMERAS = {"persp", "top", "front", "side", "back", "bottom", "left"}
+
+
+def _scene_roots():
+    """Top-level transforms for a "Whole Scene" publish — every assembly except the
+    default cameras and the hidden lookdev material-source helper group."""
+    out = []
+    for a in (cmds.ls(assemblies=True, long=True) or []):
+        short = a.split("|")[-1]
+        if short in _DEFAULT_CAMERAS or short == LOOKDEV_SHD_GROUP:
+            continue
+        out.append(a)
+    return out
+
+
 def _run_publish():
-    """Export the publish list to disk. Returns (ok, publish_folder)."""
-    if not STATE.publish_list:
-        cmds.warning("CGPipeline: Publish list is empty.")
+    """Export the publish list (or the whole scene) to disk. Returns (ok, publish_folder)."""
+    items = _scene_roots() if STATE.publish_whole_scene else list(STATE.publish_list)
+    if not items:
+        if STATE.publish_whole_scene:
+            cmds.warning("CGPipeline: Whole Scene is on but the scene has nothing to export.")
+        else:
+            cmds.warning("CGPipeline: Publish list is empty — add objects or tick Whole Scene.")
         return False, None
     is_shot = STATE.category == "Shots"
     # Shot caches go into the task's own cache folder, e.g. Shots/<shot>/Anim/cache.
@@ -743,11 +785,15 @@ def _run_publish():
     s, e, is_anim = _frame_range()
     rng = f"_f{s:04d}_f{e:04d}"
 
+    # Whole Scene exports everything as one file (per-object only still makes sense for
+    # shot caches, which are always split so the assembly can assign each one).
+    separate = STATE.publish_separate and not STATE.publish_whole_scene
+
     if is_shot:
         # Shot caches are ALWAYS one file per selected object/group, named with the
         # object, so the assembly can assign each one:
         #   <shot>_<object>_<task>_f0001_f0024.ext  (e.g. sh01_sq0010_woody_anim_f0001_f0024.abc)
-        for obj in STATE.publish_list:
+        for obj in items:
             if not cmds.objExists(obj):
                 continue
             on = _safe_name(obj)
@@ -756,8 +802,8 @@ def _run_publish():
             else:
                 fn = f"{STATE.entity}_{on}_{abbr}{rng}{fmt}"
             _export([obj], os.path.join(pub, fn), is_anim, s, e)
-    elif STATE.publish_separate:
-        for obj in STATE.publish_list:
+    elif separate:
+        for obj in items:
             if not cmds.objExists(obj):
                 continue
             on = _safe_name(obj)
@@ -771,18 +817,27 @@ def _run_publish():
             fn = f"{STATE.entity}_lkdev{fmt}"
         else:
             fn = f"{STATE.entity}_{abbr}{fmt}"
-        _export(list(STATE.publish_list), os.path.join(pub, fn), is_anim, s, e)
+        _export(items, os.path.join(pub, fn), is_anim, s, e)
 
     return True, pub
 
 
 def op_publish(to_kitsu=False):
-    """Publish the selection list. Applies the chosen status (no separate Update button)
-    and snapshots a task thumbnail (when enabled), updating the local registry; when
-    `to_kitsu` is True, also pushes the status, thumbnail and Notes/Comment to Kitsu."""
+    """Publish the selection list (or the whole scene). Applies the chosen status, snaps a
+    thumbnail, and saves the working file (refreshing the *_master copy when "Update Master
+    File" is on). When `to_kitsu` is True, also pushes status / thumbnail / comment."""
     ok, pub = _run_publish()
     if not ok:
         return
+
+    # Update the working file, and the master copy if "Update Master File" is ticked.
+    fp = cmds.file(q=True, sceneName=True)
+    if fp:
+        try:
+            cmds.file(save=True)
+        except Exception as e:
+            print(f"CGPipeline: Could not save working file on publish: {e}")
+        _copy_to_master(fp)
 
     # Apply the status picked in the Status dropdown (registry). "NO CHANGE" is a no-op.
     new_status = STATE.publish_status
@@ -1725,16 +1780,19 @@ class CGPipelinePanel(QtWidgets.QWidget):
         frow.addWidget(vup_btn)
         outer.addLayout(frow)
 
+        # Project + task on one row, same font size / weight.
+        info_row = QtWidgets.QHBoxLayout()
+        info_row.setSpacing(10)
         self.project_label = QtWidgets.QLabel("PROJECT: -")
         self.project_label.setStyleSheet(
-            "color: #9cc3ff; font-weight: bold; font-size: 13px; padding: 2px 0 0 0;"
-        )
-        outer.addWidget(self.project_label)
+            "color: #9cc3ff; font-weight: bold; font-size: 16px; padding: 4px 0;")
         self.task_label = QtWidgets.QLabel("TASK: -")
         self.task_label.setStyleSheet(
-            "color: #ffffff; font-weight: bold; font-size: 20px; padding: 0 0 4px 0;"
-        )
-        outer.addWidget(self.task_label)
+            "color: #ffffff; font-weight: bold; font-size: 16px; padding: 4px 0;")
+        info_row.addWidget(self.project_label)
+        info_row.addWidget(self.task_label)
+        info_row.addStretch()
+        outer.addLayout(info_row)
 
         tabs = QtWidgets.QTabWidget()
         outer.addWidget(tabs, 1)
@@ -1744,17 +1802,24 @@ class CGPipelinePanel(QtWidgets.QWidget):
     # ---- tabs ----
     def _add_lookdev_section(self, v):
         """Import Model + Textures (the old LookDev tab) — now lives at the top of the
-        Assembly tab. The bottom REFRESH button rescans this list with the rest."""
-        v.addWidget(self._section("Import Model"))
+        Assembly tab. The bottom REFRESH button rescans this list with the rest.
+        Import Model is asset-only (lists the current asset's model publishes) so it's
+        hidden on Shot tasks; Textures stay available everywhere."""
+        self.import_model_section = QtWidgets.QWidget()
+        iv = QtWidgets.QVBoxLayout(self.import_model_section)
+        iv.setContentsMargins(0, 0, 0, 0)
+        iv.setSpacing(6)
+        iv.addWidget(self._section("Import Model"))
         self.model_list_w = QtWidgets.QListWidget()
         self.model_list_w.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.model_list_w.setMaximumHeight(120)
-        v.addWidget(self.model_list_w)
+        iv.addWidget(self.model_list_w)
         mrow = QtWidgets.QHBoxLayout()
         mrow.addWidget(self._btn("REFERENCE", lambda: self._on_import_model("reference")))
         mrow.addWidget(self._btn("IMPORT", lambda: self._on_import_model("import")))
-        v.addLayout(mrow)
-        v.addWidget(self._sep())
+        iv.addLayout(mrow)
+        iv.addWidget(self._sep())
+        v.addWidget(self.import_model_section)
 
         # Textures
         v.addWidget(self._section("Textures"))
@@ -1820,16 +1885,44 @@ class CGPipelinePanel(QtWidgets.QWidget):
         self.material_chk.setChecked(STATE.include_materials)
         self.material_chk.toggled.connect(lambda c: setattr(STATE, "include_materials", c))
         opts.addWidget(self.material_chk)
+        self.whole_scene_chk = QtWidgets.QCheckBox("Whole Scene")
+        self.whole_scene_chk.setChecked(STATE.publish_whole_scene)
+        self.whole_scene_chk.setToolTip(
+            "Export the entire scene — no need to add anything to the list below.")
+        self.whole_scene_chk.toggled.connect(self._on_whole_scene_changed)
+        opts.addWidget(self.whole_scene_chk)
         v.addLayout(opts)
+
+        # Additional export settings + master-file control.
+        opts2 = QtWidgets.QHBoxLayout()
+        add_btn = self._btn("Additional…", self._open_additional_dialog)
+        add_btn.setToolTip("Alembic export options: UV Write, World Space, Write "
+                           "Visibility, Write UV Sets, and Step.")
+        opts2.addWidget(add_btn)
+        self.master_chk = QtWidgets.QCheckBox("Update Master File")
+        self.master_chk.setChecked(STATE.update_master)
+        self.master_chk.setToolTip(
+            "When on, Save / Version Up / Publish also refresh the entity's *_master file. "
+            "Turn off to keep an existing master while you work on a different version.")
+        self.master_chk.toggled.connect(lambda c: setattr(STATE, "update_master", c))
+        opts2.addWidget(self.master_chk)
+        v.addLayout(opts2)
 
         v.addWidget(QtWidgets.QLabel("Selection List:"))
         self.publish_list_w = QtWidgets.QListWidget()
         self.publish_list_w.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         v.addWidget(self.publish_list_w, 1)
         lrow = QtWidgets.QHBoxLayout()
-        lrow.addWidget(self._btn("Add", self._on_publish_add))
-        lrow.addWidget(self._btn("Remove", self._on_publish_remove))
+        self._list_btns = [
+            self._btn("Add", self._on_publish_add),
+            self._btn("Remove", self._on_publish_remove),
+            self._btn("Clear", self._on_publish_clear),
+        ]
+        for b in self._list_btns:
+            lrow.addWidget(b)
         v.addLayout(lrow)
+        # Reflect any pre-set Whole Scene state on the list controls.
+        self._on_whole_scene_changed(STATE.publish_whole_scene)
 
         # Notes / Comment — posted to Kitsu when using "Publish to Kitsu".
         v.addWidget(self._section("Notes / Comment"))
@@ -1953,12 +2046,14 @@ class CGPipelinePanel(QtWidgets.QWidget):
         op_assembly_apply(batch=batch)
 
     def _update_assembly_context(self):
-        """Show the cache-assign block only for Shot tasks; on assets show the note and
-        keep just the lookdev-referencing workflow."""
+        """Adapt the Assembly tab to the task type: Shot tasks get the cache-assign block
+        (and hide the asset-only Import Model list); asset tasks get Import Model + the
+        lookdev-referencing workflow and hide the cache block."""
         is_shot = (_shot_root_from_task_path() is not None) or (STATE.category == "Shots")
         try:
             self.cache_section.setVisible(is_shot)
             self.cache_assets_note.setVisible(not is_shot)
+            self.import_model_section.setVisible(not is_shot)
         except Exception:
             pass
 
@@ -2033,8 +2128,64 @@ class CGPipelinePanel(QtWidgets.QWidget):
             self.publish_list_w.takeItem(row)
         self._sync_publish_list()
 
+    def _on_publish_clear(self):
+        self.publish_list_w.clear()
+        self._sync_publish_list()
+
     def _sync_publish_list(self):
         STATE.publish_list = [self.publish_list_w.item(i).text() for i in range(self.publish_list_w.count())]
+
+    def _on_whole_scene_changed(self, checked):
+        STATE.publish_whole_scene = checked
+        # When exporting the whole scene the per-object list is irrelevant — grey it out.
+        try:
+            self.publish_list_w.setEnabled(not checked)
+            for b in getattr(self, "_list_btns", []):
+                b.setEnabled(not checked)
+        except Exception:
+            pass
+
+    def _open_additional_dialog(self):
+        """Popup for the extra Alembic export flags (UV Write / World Space / Write
+        Visibility / Write UV Sets) plus the frame Step. Writes back to STATE on OK."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Additional Export Settings")
+        form = QtWidgets.QVBoxLayout(dlg)
+        uvw = QtWidgets.QCheckBox("UV Write");           uvw.setChecked(STATE.abc_uv_write)
+        ws = QtWidgets.QCheckBox("World Space");          ws.setChecked(STATE.abc_world_space)
+        wv = QtWidgets.QCheckBox("Write Visibility");     wv.setChecked(STATE.abc_write_visibility)
+        wuv = QtWidgets.QCheckBox("Write UV Sets");       wuv.setChecked(STATE.abc_write_uv_sets)
+        for c in (uvw, ws, wv, wuv):
+            form.addWidget(c)
+        srow = QtWidgets.QHBoxLayout()
+        srow.addWidget(QtWidgets.QLabel("Step:"))
+        step = QtWidgets.QDoubleSpinBox()
+        step.setRange(0.01, 100.0)
+        step.setSingleStep(0.1)
+        step.setDecimals(2)
+        step.setValue(STATE.abc_step)
+        srow.addWidget(step)
+        srow.addStretch()
+        form.addLayout(srow)
+        note = QtWidgets.QLabel("These apply to Alembic (.abc) export.")
+        note.setStyleSheet("color: #888888;")
+        form.addWidget(note)
+        brow = QtWidgets.QHBoxLayout()
+        cancel = QtWidgets.QPushButton("Cancel")
+        ok = QtWidgets.QPushButton("OK")
+        ok.setDefault(True)
+        cancel.clicked.connect(dlg.reject)
+        ok.clicked.connect(dlg.accept)
+        brow.addStretch()
+        brow.addWidget(cancel)
+        brow.addWidget(ok)
+        form.addLayout(brow)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            STATE.abc_uv_write = uvw.isChecked()
+            STATE.abc_world_space = ws.isChecked()
+            STATE.abc_write_visibility = wv.isChecked()
+            STATE.abc_write_uv_sets = wuv.isChecked()
+            STATE.abc_step = step.value()
 
     def _on_anim_only_changed(self, checked):
         STATE.cache_anim_only = checked

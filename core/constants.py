@@ -16,6 +16,22 @@ TASK_STATUSES = [
 
 DEFAULT_STATUS = "Todo"
 
+# Short display forms (Kitsu-style) for compact status chips on task cards.
+STATUS_SHORT = {
+    "Todo": "TODO",
+    "Work In Progress": "WIP",
+    "Waiting For Approval": "WFA",
+    "Retake": "RTK",
+    "Done": "DONE",
+    "Omit": "OMIT",
+}
+
+
+def short_status(name):
+    """Compact label for a status, falling back to the full name when unmapped."""
+    return STATUS_SHORT.get(name, name)
+
+
 # Display colours per status (used by cards / sheets).
 STATUS_COLORS = {
     "Done": "#28A745",
