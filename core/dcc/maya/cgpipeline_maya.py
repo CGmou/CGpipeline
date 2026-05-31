@@ -892,50 +892,65 @@ def _rel_key(full_path, root_long):
 
 def _apply_alembic_to_group(cache_path, grp):
     """Merge an Alembic cache onto a group's EXISTING meshes exactly like Maya's
-    'Cache > Alembic Cache > Import Cache > Merge': AbcImport -connect wires the new
-    AlembicNode straight into the existing, already-shaded shapes' .inMesh, so the
-    shading groups and per-face material assignments are left completely untouched.
-    Topology must match (same point/face count + order), which holds for a cache
-    published from the same model the lookdev was built on.
+    'Cache > Alembic Cache > Import Cache > Merge'.
 
-    Referenced/duplicated instances carry namespaces (woody:CH_Woody vs
-    woody1:CH_Woody); -connect matches node names globally and can't tell them apart,
-    so those fall back to a per-instance reconnect (_apply_alembic_by_reconnect)."""
-    _remove_existing_alembic(grp)
+    The assign list already pairs THIS group with THIS cache, so we don't depend on
+    global name matching: we select the specific (possibly namespaced) group and
+    connect the cache straight onto it. The AlembicNode drives the existing,
+    already-shaded shapes, so shading groups and per-face material assignments are
+    left untouched. Passing the namespaced group (woody:CH_Woody) scopes the merge to
+    this instance, so duplicates (woody1:CH_Woody) are not disturbed."""
     grp_long = (cmds.ls(grp, long=True) or [grp])[0]
-    grp_leaf = grp.split("|")[-1]
     cache_fwd = cache_path.replace("\\", "/")
 
-    # Single (non-namespaced) instance -> use the native merge. This is the exact
-    # "Import Cache > Merge" path and the ONLY thing it does: connect the cache to
-    # the existing shapes. Nothing is imported, rewired, or deleted, so shaders
-    # cannot break.
-    if ":" not in grp_leaf:
-        before = set(cmds.ls(assemblies=True, long=True) or [])
+    # 1. Re-apply onto an existing AlembicNode: just repoint the file. Fast, and it
+    #    preserves the existing (shaded) connections entirely.
+    nodes = _alembic_nodes_under(grp_long)
+    if nodes:
+        updated = 0
+        for n in nodes:
+            try:
+                if cmds.attributeQuery("abc_File", node=n, exists=True):
+                    cmds.setAttr(f"{n}.abc_File", cache_fwd, type="string")
+                    updated += 1
+            except Exception:
+                pass
+        if updated:
+            print(f"CGPipeline: Updated {updated} existing Alembic node(s) on {grp}")
+            return
+
+    # 2. Native merge onto the selected group (mirrors the Maya UI). Connect by the
+    #    full DAG path so the namespace is handled exactly like a manual selection.
+    #    Record existing roots first so we can clean up if -connect can't bind.
+    before = set(cmds.ls(assemblies=True, long=True) or [])
+    try:
+        cmds.select(grp_long, replace=True)
+        # mel.eval handles the path/connect string the same way the menu does.
+        mel.eval(f'AbcImport -mode "import" -connect "{grp_long}" "{cache_fwd}"')
+    except Exception as e:
+        cmds.warning(f"CGPipeline: Native merge failed for {grp}: {e}")
+
+    if _alembic_nodes_under(grp_long):
+        # Bound to the existing shapes. Remove anything the merge imported that did
+        # NOT bind (so a partial match doesn't leave duplicate geometry behind).
+        stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before - {grp_long})
+        if stray:
+            try:
+                cmds.delete(stray)
+            except Exception:
+                pass
+        print(f"CGPipeline: Cache merged onto {grp} (Native Merge).")
+        return
+
+    # 3. -connect couldn't bind (e.g. a deep namespaced hierarchy whose children
+    #    don't name-match). Delete the geometry it just imported, then fall back to
+    #    the manual per-instance reconnect so the cache is still applied.
+    stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
+    if stray:
         try:
-            cmds.select(grp_long, replace=True)
+            cmds.delete(stray)
         except Exception:
             pass
-        try:
-            cmds.AbcImport(cache_fwd, mode="import", connect=grp_leaf)
-        except Exception as e:
-            cmds.warning(f"CGPipeline: Import Cache (merge) failed: {e}")
-        # Did the cache bind to this group's existing meshes?
-        if _alembic_nodes_under(grp_long):
-            # Drop anything -connect created that did NOT match (shouldn't normally
-            # happen when names line up, but keep the scene clean if it does).
-            stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before - {grp_long})
-            if stray:
-                try: cmds.delete(stray)
-                except Exception: pass
-            print(f"CGPipeline: Cache merged onto {grp} (Import Cache > Merge).")
-            return
-        # No name match: remove any geometry -connect imported, then fall back.
-        stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
-        if stray:
-            try: cmds.delete(stray)
-            except Exception: pass
-
     _apply_alembic_by_reconnect(cache_fwd, grp, grp_long)
 
 
