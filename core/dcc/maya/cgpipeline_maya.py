@@ -957,39 +957,37 @@ def _parent_under(node, group):
 
 def _ensure_lookdev_referenced(lookdev_item):
     """Reference the lookdev ONCE as a shared material source, reusing it if already
-    present. Tracked by a TAG (not a namespace), referenced into the root namespace so
-    its nodes are clean/un-prefixed, then parented hidden under the _LOOKDEV_SHD_ group.
-    It only provides materials; the animated caches render. Returns the material-source
-    top group DAG paths."""
+    present. Uses a dedicated 'MTL_<asset>' namespace so it never clashes with a cache
+    (a clash would make Maya wrap the reference in a transform group). The (hidden)
+    geometry sits as a direct child of the _LOOKDEV_SHD_ group; it only provides
+    materials, the animated caches render. Returns the material-source top group paths."""
     asset = lookdev_item.get("asset_name") or "lkdev"
-    shd = _get_or_make_group(LOOKDEV_SHD_GROUP, hidden=True)
+    ns = "MTL_" + asset
 
-    # Reuse an existing material source for this asset (tagged under _LOOKDEV_SHD_).
-    existing = []
-    for c in (cmds.listRelatives(shd, children=True, fullPath=True) or []):
-        try:
-            if cmds.attributeQuery("cgpLookdevSrc", node=c, exists=True) and \
-                    cmds.getAttr(c + ".cgpLookdevSrc") == asset:
-                existing.append(c)
-        except Exception:
-            pass
-    if existing:
-        return existing
+    def _roots():
+        out = []
+        for n in (cmds.ls(ns + ":*", long=True, type="transform") or []):
+            p = (cmds.listRelatives(n, parent=True, fullPath=True) or [None])[0]
+            pleaf = p.split("|")[-1] if p else ""
+            if not pleaf.startswith(ns + ":"):
+                out.append(n)
+        return out
 
-    before = set(cmds.ls(assemblies=True, long=True) or [])
+    roots = _roots()
+    if roots:
+        return roots
     try:
-        cmds.file(lookdev_item["path"], reference=True, namespace=":", ignoreVersion=True)
-        print(f"CGPipeline: Referenced lookdev material source '{asset}'.")
+        cmds.file(lookdev_item["path"], reference=True, namespace=ns,
+                  mergeNamespacesOnClash=False, ignoreVersion=True)
+        print(f"CGPipeline: Referenced lookdev material source '{ns}'.")
     except Exception as e:
         cmds.warning(f"CGPipeline: Lookdev reference failed: {e}")
         return []
+    shd = _get_or_make_group(LOOKDEV_SHD_GROUP, hidden=True)
     out = []
-    for r in (set(cmds.ls(assemblies=True, long=True) or []) - before):
+    for r in _roots():
         r2 = _parent_under(r, shd)
         try:
-            if not cmds.attributeQuery("cgpLookdevSrc", node=r2, exists=True):
-                cmds.addAttr(r2, longName="cgpLookdevSrc", dataType="string")
-            cmds.setAttr(r2 + ".cgpLookdevSrc", asset, type="string")
             cmds.setAttr(r2 + ".visibility", 0)   # hide material source; caches render
         except Exception:
             pass
@@ -999,14 +997,16 @@ def _ensure_lookdev_referenced(lookdev_item):
 
 def op_reference_lookdev(lookdev_item):
     """Reference a lookdev into the scene as VISIBLE geometry — for assets that are NOT
-    driven by an animation cache (sets, props, or any asset to keep as-is). References
-    into the root namespace (no 'asset:' prefix); referencing the same asset again comes
-    in as a clean sibling (CH_Woody, CH_Woody1, …) with no wrapper. Parented under the
-    asset's category group (_CHAR_/_SETS_/_PROPS_…)."""
+    driven by an animation cache (sets, props, or any asset to keep as-is). Uses the
+    asset's namespace (auto-numbered on clash: CH_Woody, CH_Woody1, …) so referencing
+    the same asset again drops in cleanly with NO wrapper transform. Each instance sits
+    as a direct child of the asset's category group (_CHAR_/_SETS_/_PROPS_…), at the
+    same level as the imported caches."""
     asset = lookdev_item.get("asset_name") or "lkdev"
     before = set(cmds.ls(assemblies=True, long=True) or [])
     try:
-        cmds.file(lookdev_item["path"], reference=True, namespace=":", ignoreVersion=True)
+        cmds.file(lookdev_item["path"], reference=True, namespace=asset,
+                  mergeNamespacesOnClash=False, ignoreVersion=True)
     except Exception as e:
         cmds.warning(f"CGPipeline: Reference failed: {e}")
         return
