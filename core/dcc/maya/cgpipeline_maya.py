@@ -957,82 +957,122 @@ def _restore_shading(data):
     return touched
 
 
-def _apply_alembic_to_group(cache_path, grp):
-    """Merge an Alembic cache onto a group's EXISTING meshes like Maya's
-    'Cache > Alembic Cache > Import Cache > Merge'.
+def _deform_shapes_under(root):
+    """Non-intermediate mesh shapes under `root` (full DAG paths)."""
+    out = []
+    for m in (cmds.listRelatives(root, allDescendents=True, type="mesh", fullPath=True) or []):
+        try:
+            if cmds.getAttr(m + ".intermediateObject"):
+                continue
+        except Exception:
+            pass
+        out.append(m)
+    return out
 
-    Referenced lookdev puts each instance in its own namespace (woody:CH_Woody,
-    woody1:CH_Woody) while the cache root is unqualified (CH_Woody). Passing a
-    namespaced/absolute name to AbcImport -connect matches the cache's names GLOBALLY
-    (every CH_Woody), which cross-wires the copies and breaks shaders. Instead we set
-    the CURRENT NAMESPACE to this instance's namespace and connect by the BARE node
-    name, so the connect resolves CH_Woody -> woody1:CH_Woody only. The AlembicNode
-    then drives the existing shaded shapes in place, so per-face materials survive.
-    Falls back to a per-instance reconnect (+ shading restore) only if it can't bind."""
+
+def _remove_cache_rig(grp_long):
+    """Remove a previous CGPipeline cache application from a group so re-applying swaps
+    cleanly: the tagged blendShape node(s) in the group's history, the hidden cache
+    source geometry tagged for this group, and any legacy AlembicNodes from older
+    apply methods. None of this touches the shaded shapes' materials."""
+    for tm in _deform_shapes_under(grp_long):
+        for n in (cmds.listHistory(tm) or []):
+            try:
+                if cmds.nodeType(n) == "blendShape" and cmds.attributeQuery("cgpCacheRig", node=n, exists=True):
+                    cmds.delete(n)
+            except Exception:
+                pass
+    for nr in (cmds.ls(assemblies=True, long=True) or []):
+        try:
+            if cmds.attributeQuery("cgpCacheSource", node=nr, exists=True) and \
+                    cmds.getAttr(nr + ".cgpCacheSource") == grp_long:
+                cmds.delete(nr)
+        except Exception:
+            pass
+    try:
+        _remove_existing_alembic(grp_long)
+    except Exception:
+        pass
+
+
+def _apply_alembic_to_group(cache_path, grp):
+    """Apply an Alembic cache onto a group's existing meshes WITHOUT touching their
+    shading, by driving each shape with a blendShape instead of replacing its geometry.
+
+    Why a blendShape: every connect/merge approach feeds the cache mesh into the
+    existing shape (-connect or .inMesh), which disturbs the per-face material
+    partition on a combined, face-assigned object — and AbcImport -connect also matches
+    names GLOBALLY, cross-wiring duplicated instances (woody / woody1). A blendShape
+    deformer only moves points: the shaded shape is never replaced (per-face materials
+    are fully preserved) and it is created explicitly on THIS group's shapes, so it can
+    never bleed onto another instance. The imported cache geometry is kept (hidden)
+    because the blendShape reads it live for the animation."""
     grp_long = (cmds.ls(grp, long=True) or [grp])[0]
     cache_fwd = cache_path.replace("\\", "/")
-    leaf = grp_long.split("|")[-1]          # 'woody1:CH_Woody'  (or 'CH_Woody')
-    ns = leaf.rpartition(":")[0]            # 'woody1'           ('' when not referenced)
-    node_name = leaf.split(":")[-1]         # 'CH_Woody'
 
-    meshes = cmds.listRelatives(grp_long, allDescendents=True, type="mesh", fullPath=True) or []
-    if not meshes:
+    tgt_map = {}
+    for tm in _deform_shapes_under(grp_long):
+        tgt_map.setdefault(_rel_key(tm, grp_long), tm)
+    if not tgt_map:
         cmds.warning(f"CGPipeline: No meshes under {grp} to receive the cache.")
         return
 
-    # Safety net: capture per-face shading so it can be reasserted if a fallback path
-    # strips it.
-    shading = _capture_shading(meshes)
-    n_assign = sum(len(a) for _, a in shading)
-    print(f"CGPipeline: Captured shading for {len(shading)} shape(s), {n_assign} assignment(s) on {grp}.")
+    # Clean re-apply: drop a previous cache rig (blendShape + hidden source) on this
+    # group. Safe for shaders — removing a deformer never changes material assignment.
+    _remove_cache_rig(grp_long)
 
-    # NOTE: auto-removal of existing AlembicNode(s) stays disabled from the previous
-    # experiment. Re-applying a cache may stack nodes until it's re-enabled.
-    # _remove_existing_alembic(grp_long)
-
+    # Import the cache fresh (its own geometry + AlembicNode). This is scoped: we only
+    # ever blendShape THIS group's shapes to it, then hide it.
     before = set(cmds.ls(assemblies=True, long=True) or [])
-    prev_ns = cmds.namespaceInfo(currentNamespace=True) or ":"
     try:
-        # Scope name resolution to THIS instance's namespace so the connect binds the
-        # cache to woody1:CH_Woody only — not every CH_Woody in the scene.
-        if ns:
-            mel.eval(f'namespace -set ":{ns}";')
-        cmds.select(grp_long, replace=True)
-        mel.eval(f'AbcImport -mode "import" -connect "{node_name}" "{cache_fwd}"')
+        cmds.AbcImport(cache_fwd, mode="import")
     except Exception as e:
-        cmds.warning(f"CGPipeline: Namespaced merge failed for {grp}: {e}")
-    finally:
+        cmds.warning(f"CGPipeline: AbcImport failed for {grp}: {e}")
+        return
+    new_roots = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
+    if not new_roots:
+        cmds.warning(f"CGPipeline: Cache produced no geometry for {grp}.")
+        return
+
+    src_map = {}
+    for nr in new_roots:
+        for sm in _deform_shapes_under(nr):
+            src_map.setdefault(_rel_key(sm, nr), sm)
+
+    count = 0
+    for key, tgt in tgt_map.items():
+        src = src_map.get(key)
+        if not src:
+            continue
         try:
-            restore_ns = prev_ns if prev_ns.startswith(":") else ":" + prev_ns
-            mel.eval(f'namespace -set "{restore_ns}";')
+            bs = cmds.blendShape(src, tgt, frontOfChain=True, weight=[0, 1.0], name="CGP_CacheBlend#")[0]
+            try:
+                cmds.setAttr(bs + ".weight[0]", 1.0)
+            except Exception:
+                pass
+            if not cmds.attributeQuery("cgpCacheRig", node=bs, exists=True):
+                cmds.addAttr(bs, longName="cgpCacheRig", attributeType="bool")
+            count += 1
+        except Exception as e:
+            print(f"CGPipeline: blendShape failed for {tgt}: {e}")
+
+    if not count:
+        for nr in new_roots:
+            try: cmds.delete(nr)
+            except Exception: pass
+        cmds.warning(f"CGPipeline: Could not match cache meshes to {grp}; nothing applied.")
+        return
+
+    # Keep the cache geometry (it drives the blendShapes) but hide + tag it for cleanup.
+    for nr in new_roots:
+        try:
+            cmds.setAttr(nr + ".visibility", 0)
+            if not cmds.attributeQuery("cgpCacheSource", node=nr, exists=True):
+                cmds.addAttr(nr, longName="cgpCacheSource", dataType="string")
+            cmds.setAttr(nr + ".cgpCacheSource", grp_long, type="string")
         except Exception:
             pass
-
-    applied = False
-    if _alembic_nodes_under(grp_long):
-        # Bound to this instance. Remove anything it imported that did NOT bind.
-        stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before - {grp_long})
-        if stray:
-            try: cmds.delete(stray)
-            except Exception: pass
-        print(f"CGPipeline: Cache merged onto {grp} (namespace '{ns or ':'}').")
-        applied = True
-    else:
-        # Didn't bind: remove whatever was imported, then fall back to reconnect.
-        stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
-        if stray:
-            try: cmds.delete(stray)
-            except Exception: pass
-
-    if not applied:
-        _apply_alembic_by_reconnect(cache_fwd, grp, grp_long)
-
-    # Reassert the captured shading. A no-op after a clean namespaced merge; the safety
-    # net if the reconnect fallback stripped per-face shaders.
-    if shading:
-        restored = _restore_shading(shading)
-        if restored:
-            print(f"CGPipeline: Reasserted shading on {restored} shape(s) of {grp}.")
+    print(f"CGPipeline: Cache applied to {grp} via blendShape ({count} mesh(es)); shaders untouched.")
 
 
 def _apply_alembic_by_reconnect(cache_path, grp, grp_long):
