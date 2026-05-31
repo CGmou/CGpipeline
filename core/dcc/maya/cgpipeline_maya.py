@@ -844,6 +844,35 @@ def op_import_model(mode="reference"):
 # --------------------------------------------------------------------------------------
 # Operations: Assembly
 # --------------------------------------------------------------------------------------
+def _group_match_token(grp_name):
+    """The name used to match caches to a group, namespace/DAG-path stripped.
+    'woody:CH_Woody' -> 'CH_Woody'."""
+    return grp_name.split("|")[-1].split(":")[-1]
+
+
+def _remove_existing_alembic(grp):
+    """Delete any AlembicNode(s) already driving the meshes under `grp`, so applying
+    a cache replaces the previous one instead of stacking (which bogs Maya down)."""
+    try:
+        meshes = cmds.listRelatives(grp, allDescendents=True, type="mesh", fullPath=True) or []
+    except Exception:
+        meshes = []
+    nodes = set()
+    for m in meshes:
+        for n in (cmds.listHistory(m) or []):
+            try:
+                if cmds.nodeType(n) == "AlembicNode":
+                    nodes.add(n)
+            except Exception:
+                continue
+    if nodes:
+        try:
+            cmds.delete(list(nodes))
+            print(f"CGPipeline: Removed {len(nodes)} old Alembic node(s) on {grp}")
+        except Exception as e:
+            print(f"CGPipeline: Could not remove old Alembic nodes on {grp}: {e}")
+
+
 def _shot_root_from_task_path():
     if not STATE.task_path:
         return None
@@ -965,6 +994,8 @@ def op_assembly_apply(batch=False):
         ext = os.path.splitext(cache_path)[1].lower()
         try:
             if ext == ".abc":
+                # Replace any previous cache first so AlembicNodes don't pile up.
+                _remove_existing_alembic(grp)
                 # Cache > Alembic Cache > Import Cache (merge under current selection):
                 # select the target group and pass its DAG root path(s) to -connect so
                 # AbcImport attaches the cache to the matching geometry UNDER the
@@ -1304,13 +1335,19 @@ class CGPipelinePanel(QtWidgets.QWidget):
             return
         if col != 2:
             return
-        # Show a menu of available caches
+        # Show only caches whose name matches this group (namespace ignored), e.g.
+        # group 'woody:CH_Woody' -> token 'CH_Woody' -> only *_CH_Woody_* caches.
+        token = _group_match_token(STATE.collection_links[idx]["name"]).lower()
+        matches = [c for c in STATE.cache_items if token and token in c["name"].lower()]
         menu = QtWidgets.QMenu(self)
         none_act = menu.addAction("(none)")
         menu.addSeparator()
         acts = {}
-        for c in STATE.cache_items:
+        for c in matches:
             acts[menu.addAction(c["name"])] = c["name"]
+        if not matches:
+            na = menu.addAction(f"(no caches for {token})")
+            na.setEnabled(False)
         chosen = menu.exec_(QtGui.QCursor.pos())
         if chosen is None:
             return
