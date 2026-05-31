@@ -873,6 +873,70 @@ def _remove_existing_alembic(grp):
             print(f"CGPipeline: Could not remove old Alembic nodes on {grp}: {e}")
 
 
+def _rel_key(full_path, root_long):
+    """Namespace-stripped node names below `root_long`, as a tuple. Used to match a
+    cache mesh to the corresponding mesh under a target group regardless of
+    namespace, e.g. |woody1:CH_Woody|woody1:body|woody1:bodyShape -> ('body','bodyShape')."""
+    if root_long and full_path.startswith(root_long):
+        sub = full_path[len(root_long):].strip("|")
+    else:
+        sub = full_path.strip("|")
+    return tuple(p.split(":")[-1] for p in sub.split("|") if p)
+
+
+def _apply_alembic_to_group(cache_path, grp):
+    """Apply an Alembic cache onto a SPECIFIC group's existing meshes, isolated per
+    instance so duplicated characters (woody:CH_Woody, woody1:CH_Woody) each get
+    their own cache. Imports the cache fresh, reconnects its AlembicNode outputs to
+    the target group's matching meshes (by namespace-stripped path), then deletes
+    the temporary imported geometry. AbcImport -connect can't do this for
+    duplicates because it matches node names globally."""
+    _remove_existing_alembic(grp)
+    grp_long = (cmds.ls(grp, long=True) or [grp])[0]
+    tgt_map = {}
+    for tm in (cmds.listRelatives(grp_long, allDescendents=True, type="mesh", fullPath=True) or []):
+        tgt_map[_rel_key(tm, grp_long)] = tm
+    if not tgt_map:
+        cmds.warning(f"CGPipeline: No meshes under {grp} to receive the cache.")
+        return
+
+    before = set(cmds.ls(assemblies=True, long=True) or [])
+    try:
+        cmds.AbcImport(cache_path, mode="import")
+    except Exception as e:
+        cmds.warning(f"CGPipeline: AbcImport failed: {e}")
+        return
+    new_roots = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
+    if not new_roots:
+        cmds.warning("CGPipeline: Cache produced no new geometry to connect.")
+        return
+
+    reconnected = 0
+    for nr in new_roots:
+        for nm in (cmds.listRelatives(nr, allDescendents=True, type="mesh", fullPath=True) or []):
+            tgt = tgt_map.get(_rel_key(nm, nr))
+            if not tgt:
+                continue
+            src = cmds.listConnections(nm + ".inMesh", plugs=True, source=True, destination=False) or []
+            if not src:
+                continue
+            try:
+                cmds.connectAttr(src[0], tgt + ".inMesh", force=True)
+                reconnected += 1
+            except Exception:
+                pass
+
+    if reconnected:
+        for nr in new_roots:
+            try:
+                cmds.delete(nr)  # remove temp geometry; the AlembicNode now drives the target
+            except Exception:
+                pass
+        print(f"CGPipeline: Cache applied to {grp} ({reconnected} meshes).")
+    else:
+        cmds.warning(f"CGPipeline: Could not match cache meshes to {grp}; imported cache kept as-is.")
+
+
 def _shot_root_from_task_path():
     if not STATE.task_path:
         return None
@@ -994,18 +1058,9 @@ def op_assembly_apply(batch=False):
         ext = os.path.splitext(cache_path)[1].lower()
         try:
             if ext == ".abc":
-                # Replace any previous cache first so AlembicNodes don't pile up.
-                _remove_existing_alembic(grp)
-                # Cache > Alembic Cache > Import Cache (merge under current selection):
-                # select the target group and pass its DAG root path(s) to -connect so
-                # AbcImport attaches the cache to the matching geometry UNDER the
-                # selection (by name) instead of creating a new disconnected hierarchy.
-                try:
-                    cmds.select(grp, replace=True)
-                except Exception:
-                    pass
-                roots = cmds.ls(selection=True, long=True) or [grp]
-                cmds.AbcImport(cache_path, mode="import", connect=" ".join(roots))
+                # Per-instance apply: isolates duplicated characters and replaces the
+                # previous cache instead of stacking AlembicNodes.
+                _apply_alembic_to_group(cache_path, grp)
             elif ext in (".usd", ".usda", ".usdc"):
                 cmds.mayaUSDImport(file=cache_path)
             elif ext == ".fbx":
