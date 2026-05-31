@@ -1546,17 +1546,28 @@ class CGPipelinePanel(QtWidgets.QWidget):
             by_cat.setdefault(it.get("category") or "Misc", []).append(a)
         for cat in sorted(by_cat):
             top = QtWidgets.QTreeWidgetItem([cat])
-            top.setFlags(QtCore.Qt.ItemIsEnabled)   # category header: not selectable
+            top.setFlags(QtCore.Qt.ItemIsEnabled)   # category header: not checkable
             self.lookdev_ref_tree.addTopLevelItem(top)
             for a in sorted(by_cat[cat]):
-                top.addChild(QtWidgets.QTreeWidgetItem([a]))
+                leaf = QtWidgets.QTreeWidgetItem([a])
+                leaf.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled
+                              | QtCore.Qt.ItemIsSelectable)
+                leaf.setCheckState(0, QtCore.Qt.Unchecked)   # checkbox beside the name
+                top.addChild(leaf)
             top.setExpanded(True)
 
     def _on_reference_lookdev(self):
-        # Only leaf items (assets) are selectable; ignore category headers.
-        assets = [w.text(0) for w in self.lookdev_ref_tree.selectedItems() if w.childCount() == 0]
+        # Reference the CHECKED assets (the checkbox shows what's selected to bring in).
+        assets = []
+        root = self.lookdev_ref_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            cat_item = root.child(i)
+            for j in range(cat_item.childCount()):
+                leaf = cat_item.child(j)
+                if leaf.checkState(0) == QtCore.Qt.Checked:
+                    assets.append(leaf.text(0))
         if not assets:
-            cmds.warning("CGPipeline: Select a lookdev asset to reference.")
+            cmds.warning("CGPipeline: Tick a lookdev asset to reference.")
             return
         for a in assets:
             it = next((x for x in STATE.lookdev_items if x.get("asset_name") == a), None)
