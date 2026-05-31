@@ -919,14 +919,16 @@ def _apply_alembic_to_group(cache_path, grp):
             print(f"CGPipeline: Updated {updated} existing Alembic node(s) on {grp}")
             return
 
-    # 2. Native merge onto the selected group (mirrors the Maya UI). Connect by the
-    #    full DAG path so the namespace is handled exactly like a manual selection.
-    #    Record existing roots first so we can clean up if -connect can't bind.
+    # 2. Native merge onto the selected group, mirroring the Maya UI exactly: select
+    #    the group, then connect using the node's SELECTION name (e.g. woody1:CH_Woody)
+    #    — the unique namespaced name the outliner/menu uses, NOT the full |pipe path.
+    #    That scopes the connection to THIS instance, so applying woody1:'s cache does
+    #    not cross-wire woody:'s geo. Record existing roots so we can clean up on miss.
     before = set(cmds.ls(assemblies=True, long=True) or [])
     try:
         cmds.select(grp_long, replace=True)
-        # mel.eval handles the path/connect string the same way the menu does.
-        mel.eval(f'AbcImport -mode "import" -connect "{grp_long}" "{cache_fwd}"')
+        connect_name = (cmds.ls(selection=True) or [grp])[0]
+        mel.eval(f'AbcImport -mode "import" -connect "{connect_name}" "{cache_fwd}"')
     except Exception as e:
         cmds.warning(f"CGPipeline: Native merge failed for {grp}: {e}")
 
