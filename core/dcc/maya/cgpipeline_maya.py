@@ -3,10 +3,11 @@
 Mirrors core/dcc/blender/cgpipeline_blender.py:
   - Reads CGP_* env vars on startup, applies color management, loads plugins.
   - Polls maya_command.json so the dashboard can open tasks in this Maya session.
-  - Adds a CGPipeline shelf and a dockable panel: Status, Publish, Assembly, Quick Tools.
-  - Operations: Save / Version Up / Update Status / Publish (ABC/USD/FBX/MA) /
-    Fix Missing Textures / Switch 2K-4K / Assembly scan / Reference Lookdev /
-    Apply Caches (Alembic by hierarchy, USD via mayaUsdImport, FBX import).
+  - Adds a CGPipeline shelf and a panel: header (Open Dashboard, Save, Version Up,
+    Project/Task labels) + Publish and Assembly tabs.
+  - Operations: Save / Version Up / Publish (ABC/USD/FBX/MA, applies status +
+    thumbnail) / Publish to Kitsu / Clean Up / Fix Missing Textures / Switch 2K-4K /
+    Import Model / Assembly scan / Reference Lookdev / Apply Caches.
 """
 
 import os
@@ -67,6 +68,7 @@ class PipelineState:
     include_materials = True
     publish_notes = ""       # comment sent to Kitsu on "Publish to Kitsu"
     auto_thumbnail = True    # snapshot the viewport as the task thumbnail on publish
+    publish_status = "NO CHANGE"   # status applied when publishing (no manual button)
 
     # Assembly
     lookdev_items = []      # [{name, path, asset_name}]
@@ -482,15 +484,14 @@ def op_save_version():
         cmds.warning(f"CGPipeline: Version save failed: {e}")
 
 
-def op_update_status(new_status):
-    if not STATE.reg_path or not os.path.exists(STATE.reg_path):
-        cmds.warning("CGPipeline: No registry path.")
-        return
-    if not STATE.task_id:
-        cmds.warning("CGPipeline: No task ID.")
-        return
+def _set_task_status(new_status):
+    """Write the chosen status onto the current task in the registry. Returns True if it
+    was written. Kitsu is handled by the caller (publish) so a local publish doesn't push
+    and a Publish-to-Kitsu pushes status + thumbnail in one go. 'NO CHANGE' is a no-op."""
     if not new_status or new_status == "NO CHANGE":
-        return
+        return False
+    if not STATE.reg_path or not os.path.exists(STATE.reg_path) or not STATE.task_id:
+        return False
     try:
         with open(STATE.reg_path, "r") as f:
             data = json.load(f)
@@ -501,11 +502,25 @@ def op_update_status(new_status):
         with open(STATE.reg_path, "w") as f:
             json.dump(data, f, indent=4)
         print(f"CGPipeline: Status → {new_status}")
-        # Best-effort: push the status change up to Kitsu.
-        fire_kitsu_sync(STATE.reg_path, STATE.entity, STATE.category,
-                        STATE.task_type, status=new_status)
+        return True
     except Exception as e:
         cmds.warning(f"CGPipeline: Status update failed: {e}")
+        return False
+
+
+def _project_name():
+    """Project display name from registry.json, falling back to the project folder name."""
+    if STATE.reg_path and os.path.exists(STATE.reg_path):
+        try:
+            with open(STATE.reg_path, "r") as f:
+                name = json.load(f).get("project_name", "")
+            if name:
+                return name
+        except Exception:
+            pass
+    if STATE.reg_path:
+        return os.path.basename(os.path.dirname(STATE.reg_path)) or "-"
+    return "-"
 
 
 # --------------------------------------------------------------------------------------
@@ -749,12 +764,16 @@ def _run_publish():
 
 
 def op_publish(to_kitsu=False):
-    """Publish the selection list. Always snapshots a task thumbnail (when enabled) and
-    updates the local registry; when `to_kitsu` is True, also pushes the thumbnail and
-    the Notes/Comment up to Kitsu."""
+    """Publish the selection list. Applies the chosen status (no separate Update button)
+    and snapshots a task thumbnail (when enabled), updating the local registry; when
+    `to_kitsu` is True, also pushes the status, thumbnail and Notes/Comment to Kitsu."""
     ok, pub = _run_publish()
     if not ok:
         return
+
+    # Apply the status picked in the Status dropdown (registry). "NO CHANGE" is a no-op.
+    new_status = STATE.publish_status
+    status_changed = _set_task_status(new_status)
 
     # Auto-snapshot a thumbnail after a successful publish and set it on the task.
     thumb = None
@@ -762,21 +781,24 @@ def op_publish(to_kitsu=False):
         thumb, tmsg = capture_task_thumbnail()
         print(f"CGPipeline: Auto thumbnail: {tmsg}")
 
+    status_line = f"\nStatus → {new_status}" if status_changed else ""
+
     if to_kitsu:
-        # Push the new thumbnail + the publish comment up to Kitsu (system Python). Skip
-        # if there's nothing to send (status has its own Update button).
+        # Push status + thumbnail + comment up to Kitsu in one go (system Python).
         note = STATE.publish_notes.strip() or None
-        if thumb or note:
+        if status_changed or thumb or note:
             fire_kitsu_sync(
                 STATE.reg_path, STATE.entity, STATE.category, STATE.task_type,
+                status=(new_status if status_changed else None),
                 thumbnail=thumb, comment=note,
             )
-            kmsg = "Kitsu update dispatched (thumbnail / comment)."
+            kmsg = "Kitsu update dispatched (status / thumbnail / comment)."
         else:
-            kmsg = "Nothing to send to Kitsu — enable Auto Thumbnail or add a note."
-        cmds.confirmDialog(title="Publish to Kitsu", message=f"Published → {pub}\n\n{kmsg}")
+            kmsg = "Nothing to send to Kitsu — pick a status, enable Auto Thumbnail, or add a note."
+        cmds.confirmDialog(title="Publish to Kitsu",
+                           message=f"Published → {pub}{status_line}\n\n{kmsg}")
     else:
-        cmds.confirmDialog(title="Publish", message=f"Published → {pub}")
+        cmds.confirmDialog(title="Publish", message=f"Published → {pub}{status_line}")
 
 
 # --------------------------------------------------------------------------------------
@@ -1649,27 +1671,26 @@ class CGPipelinePanel(QtWidgets.QWidget):
         frow.addWidget(self._btn("Version Up", op_save_version))
         outer.addLayout(frow)
 
+        self.project_label = QtWidgets.QLabel("PROJECT: -")
+        self.project_label.setStyleSheet(
+            "color: #9cc3ff; font-weight: bold; font-size: 13px; padding: 2px 0 0 0;"
+        )
+        outer.addWidget(self.project_label)
         self.task_label = QtWidgets.QLabel("TASK: -")
         self.task_label.setStyleSheet(
-            "color: #ffffff; font-weight: bold; font-size: 20px; padding: 4px 0;"
+            "color: #ffffff; font-weight: bold; font-size: 20px; padding: 0 0 4px 0;"
         )
         outer.addWidget(self.task_label)
 
         tabs = QtWidgets.QTabWidget()
         outer.addWidget(tabs, 1)
-        tabs.addTab(self._make_model_tab(), "LookDev")
         tabs.addTab(self._make_publish_tab(), "Publish")
         tabs.addTab(self._make_assembly_tab(), "Assembly")
 
     # ---- tabs ----
-    def _make_model_tab(self):
-        # The LookDev stage tab: bring in the asset's model, plus texture tools.
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
-
-        # Import Model — list the models available to reference/import.
+    def _add_lookdev_section(self, v):
+        """Import Model + Textures (the old LookDev tab) — now lives at the top of the
+        Assembly tab."""
         hdr = QtWidgets.QHBoxLayout()
         hdr.addWidget(self._section("Import Model"))
         hdr.addStretch()
@@ -1677,7 +1698,8 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.addLayout(hdr)
         self.model_list_w = QtWidgets.QListWidget()
         self.model_list_w.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        v.addWidget(self.model_list_w, 1)
+        self.model_list_w.setMaximumHeight(120)
+        v.addWidget(self.model_list_w)
         mrow = QtWidgets.QHBoxLayout()
         mrow.addWidget(self._btn("REFERENCE", lambda: self._on_import_model("reference")))
         mrow.addWidget(self._btn("IMPORT", lambda: self._on_import_model("import")))
@@ -1691,9 +1713,8 @@ class CGPipelinePanel(QtWidgets.QWidget):
         trow.addWidget(self._btn("2K", lambda: op_switch_texture_res("2k")))
         trow.addWidget(self._btn("4K", lambda: op_switch_texture_res("4k")))
         v.addLayout(trow)
-
+        v.addWidget(self._sep())
         self._refresh_model_list()
-        return self._wrap_scroll(w)
 
     def _make_publish_tab(self):
         w = QtWidgets.QWidget()
@@ -1701,14 +1722,15 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
-        # Status (moved here from the old "Task" tab) — updates the registry and Kitsu.
-        v.addWidget(self._section("Status"))
-        srow = QtWidgets.QHBoxLayout()
+        # Status — applied automatically on Publish (no separate Update button). Leave it
+        # on "NO CHANGE" to keep the current status.
+        v.addWidget(self._section("Status (applied on Publish)"))
         self.status_combo = QtWidgets.QComboBox()
         self.status_combo.addItems(STATUS_CHOICES)
-        srow.addWidget(self.status_combo, 1)
-        srow.addWidget(self._btn("Update", lambda: op_update_status(self.status_combo.currentText())))
-        v.addLayout(srow)
+        self.status_combo.setCurrentText(STATE.publish_status)
+        self.status_combo.currentTextChanged.connect(
+            lambda t: setattr(STATE, "publish_status", t))
+        v.addWidget(self.status_combo)
         v.addWidget(self._sep())
 
         v.addWidget(self._section("Publish"))
@@ -1777,21 +1799,23 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.addWidget(self.thumb_chk)
         v.addWidget(self._btn("Snapshot Thumbnail", self._on_snapshot_thumb))
 
-        # Publish locally, or publish + push thumbnail/comment to Kitsu.
+        # Clean Up — optimize/cleanup the scene; sits above Publish as a pre-publish step.
+        v.addWidget(self._sep())
+        cleanup_btn = self._btn("CLEAN UP", self._on_cleanup)
+        cleanup_btn.setStyleSheet(
+            "font-weight: bold; padding: 6px; background-color: #f0c000; color: #000000;")
+        cleanup_btn.setToolTip(
+            "Optimize the scene: remove unknown nodes, delete unused nodes, "
+            "merge duplicate shaders, and strip extra UV sets (keep only map1).")
+        v.addWidget(cleanup_btn)
+
+        # Publish locally, or publish + push status/thumbnail/comment to Kitsu.
         publish_btn = self._btn("PUBLISH", lambda: op_publish(False))
         publish_btn.setStyleSheet("font-weight: bold; padding: 6px;")
         v.addWidget(publish_btn)
         kitsu_btn = self._btn("PUBLISH TO KITSU", lambda: op_publish(True))
         kitsu_btn.setStyleSheet("font-weight: bold; padding: 6px; background-color: #2f6f4f;")
         v.addWidget(kitsu_btn)
-
-        # Clean Up — optimize/cleanup the scene before publishing.
-        v.addWidget(self._sep())
-        cleanup_btn = self._btn("CLEAN UP", self._on_cleanup)
-        cleanup_btn.setToolTip(
-            "Optimize the scene: remove unknown nodes, delete unused nodes, "
-            "merge duplicate shaders, and strip extra UV sets (keep only map1).")
-        v.addWidget(cleanup_btn)
         return self._wrap_scroll(w)
 
     def _on_snapshot_thumb(self):
@@ -1813,6 +1837,9 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(w)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
+
+        # LookDev tools (Import Model + Textures) merged in from the old LookDev tab.
+        self._add_lookdev_section(v)
 
         # Cache assignment is a Shot-only workflow (animation caches assigned a lookdev).
         # On an asset task there are no caches, so this whole block is hidden and a short
@@ -1904,6 +1931,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         return f"{STATE.entity}_{abbr}" if abbr else STATE.entity
 
     def _refresh_state_labels(self):
+        self.project_label.setText(f"PROJECT: {_project_name()}")
         self.task_label.setText(f"TASK: {self._entity_task_name()}")
 
     def _auto_populate(self):
