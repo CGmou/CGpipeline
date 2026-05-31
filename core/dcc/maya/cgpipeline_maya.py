@@ -67,7 +67,6 @@ class PipelineState:
     publish_separate = False
     include_materials = True
     publish_notes = ""       # comment sent to Kitsu on "Publish to Kitsu"
-    auto_thumbnail = True    # snapshot the viewport as the task thumbnail on publish
     publish_status = "NO CHANGE"   # status applied when publishing (no manual button)
 
     # Assembly
@@ -789,11 +788,9 @@ def op_publish(to_kitsu=False):
     new_status = STATE.publish_status
     status_changed = _set_task_status(new_status)
 
-    # Auto-snapshot a thumbnail after a successful publish and set it on the task.
-    thumb = None
-    if STATE.auto_thumbnail:
-        thumb, tmsg = capture_task_thumbnail()
-        print(f"CGPipeline: Auto thumbnail: {tmsg}")
+    # Always snapshot a thumbnail on publish and set it on the task.
+    thumb, tmsg = capture_task_thumbnail()
+    print(f"CGPipeline: Auto thumbnail: {tmsg}")
 
     status_line = f"\nStatus → {new_status}" if status_changed else ""
 
@@ -808,7 +805,7 @@ def op_publish(to_kitsu=False):
             )
             kmsg = "Kitsu update dispatched (status / thumbnail / comment)."
         else:
-            kmsg = "Nothing to send to Kitsu — pick a status, enable Auto Thumbnail, or add a note."
+            kmsg = "Nothing to send to Kitsu — pick a status or add a note."
         cmds.confirmDialog(title="Publish to Kitsu",
                            message=f"Published → {pub}{status_line}\n\n{kmsg}")
     else:
@@ -1071,18 +1068,53 @@ def _cleanup_uv_sets():
     return count
 
 
+def _remove_turtle_nodes():
+    """Remove Autodesk Turtle renderer leftovers — its persistent nodes plus the plugin
+    itself. Turtle nodes are a frequent source of 'unknown'/dirty nodes in published
+    scenes. Returns the count of nodes removed."""
+    count = 0
+    nodes = set()
+    for n in ("TurtleDefaultBakeLayer", "TurtleRenderOptions",
+              "TurtleUIOptions", "TurtleBakeLayerManager"):
+        if cmds.objExists(n):
+            nodes.add(n)
+    for t in ("ilrOptionsNode", "ilrUIOptionsNode", "ilrBakeLayerManager", "ilrBakeLayer"):
+        nodes.update(cmds.ls(type=t) or [])
+    for n in nodes:
+        if not cmds.objExists(n):
+            continue
+        try:
+            cmds.lockNode(n, lock=False)
+        except Exception:
+            pass
+        try:
+            cmds.delete(n)
+            count += 1
+        except Exception:
+            pass
+    # Unload the plugin so the nodes don't get recreated and the scene stops requiring it.
+    try:
+        if cmds.pluginInfo("Turtle", q=True, loaded=True):
+            cmds.unloadPlugin("Turtle")
+    except Exception:
+        pass
+    return count
+
+
 def op_cleanup_scene():
-    """Optimize / clean the current scene: remove unknown nodes, delete unused shading
-    nodes, merge duplicate shaders, and strip extra UV sets (keeping only the default
-    'map1'). Equivalent to Maya's Optimize Scene Size with those options, done explicitly
-    so the result is predictable."""
+    """Optimize / clean the current scene: remove unknown nodes, remove Turtle renderer
+    leftovers, delete unused shading nodes, merge duplicate shaders, and strip extra UV
+    sets (keeping only the default 'map1'). Equivalent to Maya's Optimize Scene Size with
+    those options, done explicitly so the result is predictable."""
     removed_unknown = _remove_unknown_nodes()
+    removed_turtle = _remove_turtle_nodes()
     merged_shaders = _remove_duplicate_shaders()
     unused_ok = _delete_unused_nodes()
     cleaned_uv = _cleanup_uv_sets()
     msg = (
         "Clean Up complete:\n"
         f"  • Unknown nodes removed: {removed_unknown}\n"
+        f"  • Turtle nodes removed: {removed_turtle}\n"
         f"  • Duplicate shaders merged: {merged_shaders}\n"
         f"  • Unused nodes: {'deleted' if unused_ok else 'skipped (error)'}\n"
         f"  • Meshes with extra UV sets cleaned: {cleaned_uv}"
@@ -1676,13 +1708,21 @@ class CGPipelinePanel(QtWidgets.QWidget):
         # Always-visible header: dashboard entry point, file actions, current task.
         dash_btn = self._btn("Open Dashboard", op_open_dashboard)
         dash_btn.setMinimumHeight(48)  # ~2 rows tall
+        dash_btn.setStyleSheet(
+            "background-color: #0078D4; color: #ffffff; font-weight: bold;")
         outer.addWidget(dash_btn)
 
         # File actions live in the header (moved out of the old "Task" tab) so Save /
         # Version Up are always one click away regardless of the active tab.
         frow = QtWidgets.QHBoxLayout()
-        frow.addWidget(self._btn("Save", op_save))
-        frow.addWidget(self._btn("Version Up", op_save_version))
+        save_btn = self._btn("Save", op_save)
+        save_btn.setStyleSheet(
+            "background-color: #E58A2E; color: #000000; font-weight: bold; padding: 4px;")
+        vup_btn = self._btn("Version Up", op_save_version)
+        vup_btn.setStyleSheet(
+            "background-color: #3FA34D; color: #ffffff; font-weight: bold; padding: 4px;")
+        frow.addWidget(save_btn)
+        frow.addWidget(vup_btn)
         outer.addLayout(frow)
 
         self.project_label = QtWidgets.QLabel("PROJECT: -")
@@ -1704,12 +1744,8 @@ class CGPipelinePanel(QtWidgets.QWidget):
     # ---- tabs ----
     def _add_lookdev_section(self, v):
         """Import Model + Textures (the old LookDev tab) — now lives at the top of the
-        Assembly tab."""
-        hdr = QtWidgets.QHBoxLayout()
-        hdr.addWidget(self._section("Import Model"))
-        hdr.addStretch()
-        hdr.addWidget(self._btn("Refresh", self._refresh_model_list))
-        v.addLayout(hdr)
+        Assembly tab. The bottom REFRESH button rescans this list with the rest."""
+        v.addWidget(self._section("Import Model"))
         self.model_list_w = QtWidgets.QListWidget()
         self.model_list_w.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.model_list_w.setMaximumHeight(120)
@@ -1738,7 +1774,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
 
         # Status — applied automatically on Publish (no separate Update button). Leave it
         # on "NO CHANGE" to keep the current status.
-        v.addWidget(self._section("Status (applied on Publish)"))
+        v.addWidget(self._section("Status"))
         self.status_combo = QtWidgets.QComboBox()
         self.status_combo.addItems(STATUS_CHOICES)
         self.status_combo.setCurrentText(STATE.publish_status)
@@ -1806,20 +1842,13 @@ class CGPipelinePanel(QtWidgets.QWidget):
             lambda: setattr(STATE, "publish_notes", self.notes_edit.toPlainText()))
         v.addWidget(self.notes_edit)
 
-        # Thumbnail — auto-snapshot on publish, plus a manual snapshot button.
-        self.thumb_chk = QtWidgets.QCheckBox("Auto Thumbnail on Publish")
-        self.thumb_chk.setChecked(STATE.auto_thumbnail)
-        self.thumb_chk.toggled.connect(lambda c: setattr(STATE, "auto_thumbnail", c))
-        v.addWidget(self.thumb_chk)
-        v.addWidget(self._btn("Snapshot Thumbnail", self._on_snapshot_thumb))
-
         # Clean Up — optimize/cleanup the scene; sits above Publish as a pre-publish step.
         v.addWidget(self._sep())
         cleanup_btn = self._btn("CLEAN UP", self._on_cleanup)
         cleanup_btn.setStyleSheet(
             "font-weight: bold; padding: 6px; background-color: #f0c000; color: #000000;")
         cleanup_btn.setToolTip(
-            "Optimize the scene: remove unknown nodes, delete unused nodes, "
+            "Optimize the scene: remove unknown + Turtle nodes, delete unused nodes, "
             "merge duplicate shaders, and strip extra UV sets (keep only map1).")
         v.addWidget(cleanup_btn)
 
@@ -1831,17 +1860,6 @@ class CGPipelinePanel(QtWidgets.QWidget):
         kitsu_btn.setStyleSheet("font-weight: bold; padding: 6px; background-color: #2f6f4f;")
         v.addWidget(kitsu_btn)
         return self._wrap_scroll(w)
-
-    def _on_snapshot_thumb(self):
-        path, msg = capture_task_thumbnail()
-        if path:
-            print(f"CGPipeline: {msg}")
-            try:
-                cmds.inViewMessage(amg=f"CGPipeline: {msg}", pos="midCenter", fade=True)
-            except Exception:
-                pass
-        else:
-            cmds.warning(f"CGPipeline: {msg}")
 
     def _on_cleanup(self):
         op_cleanup_scene()
@@ -1902,10 +1920,18 @@ class CGPipelinePanel(QtWidgets.QWidget):
         rrow.addWidget(self._btn("CLEAR ALL", self._clear_ref_checks))
         v.addLayout(rrow)
 
-        # Refresh rescans and rebuilds BOTH lists above.
+        # One REFRESH rescans the Import Model list AND rebuilds the assembly lists.
         v.addWidget(self._sep())
-        v.addWidget(self._btn("REFRESH", self._on_assembly_scan))
+        refresh_btn = self._btn("REFRESH", self._on_assembly_refresh_all)
+        refresh_btn.setStyleSheet("font-weight: bold; padding: 6px;")
+        v.addWidget(refresh_btn)
         return self._wrap_scroll(w)
+
+    def _on_assembly_refresh_all(self):
+        """Rescan everything in the Assembly tab: the Import Model list and both the
+        cache-assign and lookdev-reference lists."""
+        self._refresh_model_list()
+        self._on_assembly_scan()
 
     def _clear_cache_checks(self):
         """Untick every cache in the Assign-Lookdev list."""
