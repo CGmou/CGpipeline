@@ -35,6 +35,18 @@ TASK_ABBR = {
     "Comp": "comp", "FX": "fx", "CFX": "cfx", "Assembly": "asb", "Setdress": "sd",
 }
 
+# Task status vocabulary, Kitsu-aligned (see core/constants.py). "NO CHANGE" is a
+# UI-only sentinel that leaves the status untouched.
+STATUS_CHOICES = [
+    "NO CHANGE", "Todo", "Work In Progress", "Waiting For Approval", "Retake", "Done",
+]
+
+# Default Maya nodes the Clean Up must never delete when merging duplicate shaders.
+_PROTECTED_SHADING = {
+    "initialShadingGroup", "initialParticleSE", "lambert1",
+    "particleCloud1", "standardSurface1",
+}
+
 
 class PipelineState:
     """Session-level pipeline context. Populated from env vars; mutated by the UI."""
@@ -53,6 +65,8 @@ class PipelineState:
     end_frame = 1100
     publish_separate = False
     include_materials = True
+    publish_notes = ""       # comment sent to Kitsu on "Publish to Kitsu"
+    auto_thumbnail = True    # snapshot the viewport as the task thumbnail on publish
 
     # Assembly
     lookdev_items = []      # [{name, path, asset_name}]
@@ -343,21 +357,18 @@ def _start_command_watcher():
 # --------------------------------------------------------------------------------------
 # Operations: Core
 # --------------------------------------------------------------------------------------
-def op_open_dashboard():
-    root = _standalone_root()
-    main_py = os.path.normpath(os.path.join(root, "main.py"))
-    if not os.path.exists(main_py):
-        cmds.warning(f"CGPipeline: main.py not found at {main_py}")
-        return
+def _find_system_python():
     if os.name == "nt":
-        py_exe = shutil.which("pythonw") or shutil.which("python") or "python"
-    else:
-        py_exe = shutil.which("python3") or shutil.which("python") or "python3"
-    # Launch with a CLEANED environment. If we inherit Maya's env, PYTHONHOME /
-    # PYTHONPATH point at Maya's own interpreter + its bundled PySide6/Qt, so the
-    # system Python running main.py loads Maya's libraries and breaks — the dashboard
-    # opens against the wrong interpreter and can't load projects/tasks. Strip the
-    # Python/Qt/loader vars so the external Python uses its own stdlib + site-packages.
+        return shutil.which("pythonw") or shutil.which("python") or "python"
+    return shutil.which("python3") or shutil.which("python") or "python3"
+
+
+def _clean_system_env():
+    """A copy of the environment with Maya's Python/Qt/loader vars stripped. If a
+    subprocess inherits Maya's env, PYTHONHOME / PYTHONPATH point at Maya's own
+    interpreter + its bundled PySide6/Qt, so the system Python loads Maya's libraries
+    and breaks. Stripping them makes the external Python use its own stdlib +
+    site-packages (where gazu and the dashboard's deps live)."""
     env = os.environ.copy()
     for var in (
         "PYTHONHOME", "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
@@ -365,6 +376,46 @@ def op_open_dashboard():
         "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH",
     ):
         env.pop(var, None)
+    return env
+
+
+def fire_kitsu_sync(reg, entity, category, task_type, status=None, thumbnail=None, comment=None):
+    """Fire-and-forget: push a task's status / thumbnail / comment up to Kitsu via the
+    system Python (which has gazu). Runs core/kitsu_sync.py in a cleaned environment so
+    Maya's bundled interpreter doesn't shadow the system one. Never blocks or raises."""
+    if not reg or not entity or not task_type:
+        return
+    script = os.path.normpath(os.path.join(_standalone_root(), "core", "kitsu_sync.py"))
+    if not os.path.exists(script):
+        print(f"CGPipeline: kitsu_sync.py not found at {script}; skipping Kitsu sync.")
+        return
+    try:
+        cmd = [_find_system_python(), script,
+               "--registry", reg, "--entity", str(entity),
+               "--category", category or "Assets", "--task-type", task_type]
+        if status and status != "NO CHANGE":
+            cmd += ["--status", status]
+        if thumbnail:
+            cmd += ["--thumbnail", thumbnail]
+        if comment:
+            cmd += ["--comment", comment]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        subprocess.Popen(cmd, env=_clean_system_env(), creationflags=creationflags)
+        print("CGPipeline: Kitsu sync dispatched.")
+    except Exception as e:
+        print(f"CGPipeline: Could not dispatch Kitsu sync: {e}")
+
+
+def op_open_dashboard():
+    root = _standalone_root()
+    main_py = os.path.normpath(os.path.join(root, "main.py"))
+    if not os.path.exists(main_py):
+        cmds.warning(f"CGPipeline: main.py not found at {main_py}")
+        return
+    py_exe = _find_system_python()
+    # Launch with a CLEANED environment (see _clean_system_env) so the dashboard opens
+    # against the system Python rather than Maya's bundled interpreter.
+    env = _clean_system_env()
     env["CGP_IN_DCC"] = "Maya"
     env["CGP_COMMAND_FILE"] = COMMAND_FILE
     if STATE.task_id:
@@ -450,6 +501,9 @@ def op_update_status(new_status):
         with open(STATE.reg_path, "w") as f:
             json.dump(data, f, indent=4)
         print(f"CGPipeline: Status → {new_status}")
+        # Best-effort: push the status change up to Kitsu.
+        fire_kitsu_sync(STATE.reg_path, STATE.entity, STATE.category,
+                        STATE.task_type, status=new_status)
     except Exception as e:
         cmds.warning(f"CGPipeline: Status update failed: {e}")
 
@@ -640,10 +694,11 @@ def _export(items, filepath, is_anim, s, e):
     return True
 
 
-def op_publish():
+def _run_publish():
+    """Export the publish list to disk. Returns (ok, publish_folder)."""
     if not STATE.publish_list:
         cmds.warning("CGPipeline: Publish list is empty.")
-        return
+        return False, None
     is_shot = STATE.category == "Shots"
     # Shot caches go into the task's own cache folder, e.g. Shots/<shot>/Anim/cache.
     # Asset publishes go to the asset's Publish folder.
@@ -653,7 +708,7 @@ def op_publish():
         pub = _resolve_publish_folder()
     if not pub:
         cmds.warning("CGPipeline: Could not resolve publish folder.")
-        return
+        return False, None
     os.makedirs(pub, exist_ok=True)
     abbr = TASK_ABBR.get(STATE.task_type, "task")
     fmt = STATE.publish_format
@@ -690,7 +745,316 @@ def op_publish():
             fn = f"{STATE.entity}_{abbr}{fmt}"
         _export(list(STATE.publish_list), os.path.join(pub, fn), is_anim, s, e)
 
-    cmds.confirmDialog(title="Publish", message=f"Published → {pub}")
+    return True, pub
+
+
+def op_publish(to_kitsu=False):
+    """Publish the selection list. Always snapshots a task thumbnail (when enabled) and
+    updates the local registry; when `to_kitsu` is True, also pushes the thumbnail and
+    the Notes/Comment up to Kitsu."""
+    ok, pub = _run_publish()
+    if not ok:
+        return
+
+    # Auto-snapshot a thumbnail after a successful publish and set it on the task.
+    thumb = None
+    if STATE.auto_thumbnail:
+        thumb, tmsg = capture_task_thumbnail()
+        print(f"CGPipeline: Auto thumbnail: {tmsg}")
+
+    if to_kitsu:
+        # Push the new thumbnail + the publish comment up to Kitsu (system Python). Skip
+        # if there's nothing to send (status has its own Update button).
+        note = STATE.publish_notes.strip() or None
+        if thumb or note:
+            fire_kitsu_sync(
+                STATE.reg_path, STATE.entity, STATE.category, STATE.task_type,
+                thumbnail=thumb, comment=note,
+            )
+            kmsg = "Kitsu update dispatched (thumbnail / comment)."
+        else:
+            kmsg = "Nothing to send to Kitsu — enable Auto Thumbnail or add a note."
+        cmds.confirmDialog(title="Publish to Kitsu", message=f"Published → {pub}\n\n{kmsg}")
+    else:
+        cmds.confirmDialog(title="Publish", message=f"Published → {pub}")
+
+
+# --------------------------------------------------------------------------------------
+# Operations: Thumbnail
+# --------------------------------------------------------------------------------------
+def _thumbnail_panel():
+    """A modelPanel to playblast from — the focused one if it's a model panel, else the
+    first available model panel (or None)."""
+    try:
+        p = cmds.getPanel(withFocus=True)
+        if p and cmds.getPanel(typeOf=p) == "modelPanel":
+            return p
+    except Exception:
+        pass
+    panels = cmds.getPanel(type="modelPanel") or []
+    return panels[0] if panels else None
+
+
+def capture_task_thumbnail():
+    """Playblast the active viewport to <project>/.thumbnails/<entity>.png and set it as
+    the thumbnail for every task of the current entity in the registry (so the dashboard
+    card picks it up). Returns (path_or_None, message)."""
+    if not STATE.reg_path or not os.path.exists(STATE.reg_path) or not STATE.entity:
+        return None, "No task context — open the task via the dashboard, or save inside a CGPipeline project."
+    project_root = os.path.dirname(STATE.reg_path)
+    thumbs_dir = os.path.join(project_root, ".thumbnails")
+    try:
+        os.makedirs(thumbs_dir, exist_ok=True)
+    except Exception as e:
+        return None, f"Could not create thumbnails folder: {e}"
+    clean = str(STATE.entity).replace(" ", "_")
+    final_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
+
+    panel = _thumbnail_panel()
+    if not panel:
+        return None, "No 3D viewport available to capture."
+    cur = int(cmds.currentTime(q=True))
+
+    # Clear the selection so selection highlights don't end up in the thumbnail, then
+    # restore it afterwards.
+    saved_sel = cmds.ls(selection=True) or []
+    try:
+        cmds.select(clear=True)
+    except Exception:
+        pass
+    kwargs = dict(
+        completeFilename=final_path, format="image", compression="png",
+        frame=[cur], viewer=False, offScreen=True, showOrnaments=False,
+        percent=100, quality=100, widthHeight=[640, 360], forceOverwrite=True,
+    )
+    try:
+        try:
+            cmds.playblast(editorPanelName=panel, **kwargs)
+        except TypeError:
+            cmds.playblast(**kwargs)   # older Maya without editorPanelName
+    except Exception as e:
+        return None, f"Playblast failed: {e}"
+    finally:
+        try:
+            if saved_sel:
+                cmds.select(saved_sel, replace=True)
+        except Exception:
+            pass
+
+    if not os.path.exists(final_path):
+        # Some Maya builds ignore completeFilename and write <name>.<frame>.png.
+        alt = f"{os.path.splitext(final_path)[0]}.{cur:04d}.png"
+        if os.path.exists(alt):
+            try:
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                shutil.move(alt, final_path)
+            except Exception:
+                final_path = alt
+        else:
+            return None, "Playblast produced no image."
+
+    # Update the registry so the dashboard card picks it up (all tasks of this entity).
+    try:
+        with open(STATE.reg_path, "r") as f:
+            data = json.load(f)
+        for tk in data.get("tasks", []):
+            if tk.get("name") == STATE.entity:
+                tk["thumbnail"] = final_path
+        with open(STATE.reg_path, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        return final_path, f"Thumbnail saved but registry update failed: {e}"
+
+    print(f"CGPipeline: Thumbnail updated → {final_path}")
+    return final_path, "Thumbnail updated."
+
+
+# --------------------------------------------------------------------------------------
+# Operations: Clean Up (Optimize Scene Size — explicit, predictable)
+# --------------------------------------------------------------------------------------
+def _remove_unknown_nodes():
+    """Delete unknown nodes (left by missing plugins) and drop unknown-plugin
+    requirements, so the scene stops carrying them. Returns the count removed."""
+    count = 0
+    nodes = []
+    for t in ("unknown", "unknownDag", "unknownTransform"):
+        nodes += cmds.ls(type=t) or []
+    for n in dict.fromkeys(nodes):
+        if not cmds.objExists(n):
+            continue
+        try:
+            if cmds.lockNode(n, q=True, lock=True)[0]:
+                cmds.lockNode(n, lock=False)
+        except Exception:
+            pass
+        try:
+            cmds.delete(n)
+            count += 1
+        except Exception:
+            pass
+    for p in (cmds.unknownPlugin(q=True, list=True) or []):
+        try:
+            cmds.unknownPlugin(p, remove=True)
+        except Exception:
+            pass
+    return count
+
+
+def _delete_unused_nodes():
+    """Maya's Hypershade "Delete Unused Nodes" (removes orphaned shading nodes)."""
+    try:
+        mel.eval("MLdeleteUnused;")
+        return True
+    except Exception as e:
+        print(f"CGPipeline: Delete unused nodes failed: {e}")
+        return False
+
+
+def _base_name(node):
+    """Short node name with namespace/DAG path and any trailing digits stripped, so
+    'ns:wood_mtl12' -> 'wood_mtl'. Used to group likely shader duplicates."""
+    short = node.split("|")[-1].split(":")[-1]
+    return re.sub(r"\d+$", "", short)
+
+
+def _shader_signature(mat):
+    """A hashable signature of a material's look: node type plus each keyable scalar /
+    common colour input — either its value, or (for connected inputs) the source file
+    texture path / source node type. Two materials with the same signature render
+    identically, so one is a duplicate of the other."""
+    try:
+        sig = [cmds.nodeType(mat)]
+    except Exception:
+        return None
+    attrs = set(cmds.listAttr(mat, keyable=True, write=True, scalar=True) or [])
+    for a in ("color", "baseColor", "diffuse", "transparency", "incandescence",
+              "specularColor", "reflectivity", "emissionColor"):
+        if cmds.attributeQuery(a, node=mat, exists=True):
+            attrs.add(a)
+    for attr in sorted(attrs):
+        plug = mat + "." + attr
+        if not cmds.objExists(plug):
+            continue
+        src = cmds.listConnections(plug, s=True, d=False) or []
+        if src:
+            snode = src[0]
+            try:
+                if cmds.nodeType(snode) == "file":
+                    sig.append((attr, "file:" + (cmds.getAttr(snode + ".fileTextureName") or "")))
+                else:
+                    sig.append((attr, "conn:" + cmds.nodeType(snode)))
+            except Exception:
+                sig.append((attr, "conn"))
+            continue
+        try:
+            val = cmds.getAttr(plug)
+        except Exception:
+            continue
+        if isinstance(val, list):
+            val = tuple(tuple(v) if isinstance(v, (list, tuple)) else v for v in val)
+        sig.append((attr, val))
+    return tuple(sig)
+
+
+def _remove_duplicate_shaders():
+    """Merge duplicate shaders: materials of the same node type, same base name and
+    identical signature are collapsed onto one, reassigning the duplicates' shading-group
+    members. Conservative — default materials are never deleted, and anything that fails
+    is left untouched. Returns the number of duplicates merged."""
+    merged = 0
+    mat_to_se = {}
+    for se in (cmds.ls(type="shadingEngine") or []):
+        for m in (cmds.listConnections(se + ".surfaceShader", s=True, d=False) or []):
+            mat_to_se.setdefault(m, se)
+    groups = {}
+    for mat, se in mat_to_se.items():
+        sig = _shader_signature(mat)
+        if sig is None:
+            continue
+        groups.setdefault((_base_name(mat), sig), []).append((mat, se))
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        # Keeper: prefer a protected/default material, then the shortest name.
+        items.sort(key=lambda x: (x[0] not in _PROTECTED_SHADING and x[1] not in _PROTECTED_SHADING,
+                                  len(x[0]), x[0]))
+        keep_mat, keep_se = items[0]
+        for dup_mat, dup_se in items[1:]:
+            if dup_se == keep_se or dup_mat in _PROTECTED_SHADING or dup_se in _PROTECTED_SHADING:
+                continue
+            try:
+                members = cmds.sets(dup_se, q=True) or []
+                if members:
+                    cmds.sets(members, forceElement=keep_se)
+                for n in (dup_se, dup_mat):
+                    if cmds.objExists(n):
+                        try:
+                            cmds.delete(n)
+                        except Exception:
+                            pass
+                merged += 1
+            except Exception as e:
+                print(f"CGPipeline: duplicate shader merge failed for {dup_mat}: {e}")
+    return merged
+
+
+def _cleanup_uv_sets():
+    """Delete every UV set on each mesh except the default — "map1" if present, else the
+    first set. Returns the number of meshes that had extra sets removed."""
+    count = 0
+    for mesh in (cmds.ls(type="mesh", long=True) or []):
+        try:
+            if cmds.getAttr(mesh + ".intermediateObject"):
+                continue
+        except Exception:
+            pass
+        try:
+            sets = cmds.polyUVSet(mesh, q=True, allUVSets=True) or []
+        except Exception:
+            continue
+        if len(sets) <= 1:
+            continue
+        keep = "map1" if "map1" in sets else sets[0]
+        # The current UV set can't be deleted, so switch to the keeper first.
+        try:
+            cmds.polyUVSet(mesh, currentUVSet=True, uvSet=keep)
+        except Exception:
+            pass
+        removed_any = False
+        for uv in sets:
+            if uv == keep:
+                continue
+            try:
+                cmds.polyUVSet(mesh, delete=True, uvSet=uv)
+                removed_any = True
+            except Exception as ex:
+                print(f"CGPipeline: Could not delete UV set '{uv}' on {mesh}: {ex}")
+        if removed_any:
+            count += 1
+    return count
+
+
+def op_cleanup_scene():
+    """Optimize / clean the current scene: remove unknown nodes, delete unused shading
+    nodes, merge duplicate shaders, and strip extra UV sets (keeping only the default
+    'map1'). Equivalent to Maya's Optimize Scene Size with those options, done explicitly
+    so the result is predictable."""
+    removed_unknown = _remove_unknown_nodes()
+    merged_shaders = _remove_duplicate_shaders()
+    unused_ok = _delete_unused_nodes()
+    cleaned_uv = _cleanup_uv_sets()
+    msg = (
+        "Clean Up complete:\n"
+        f"  • Unknown nodes removed: {removed_unknown}\n"
+        f"  • Duplicate shaders merged: {merged_shaders}\n"
+        f"  • Unused nodes: {'deleted' if unused_ok else 'skipped (error)'}\n"
+        f"  • Meshes with extra UV sets cleaned: {cleaned_uv}"
+    )
+    print("CGPipeline: " + msg.replace("\n", "  "))
+    if not cmds.about(batch=True):
+        cmds.confirmDialog(title="Clean Up", message=msg)
+    return msg
 
 
 # --------------------------------------------------------------------------------------
@@ -1273,10 +1637,18 @@ class CGPipelinePanel(QtWidgets.QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
 
-        # Always-visible header: dashboard entry point + current task.
+        # Always-visible header: dashboard entry point, file actions, current task.
         dash_btn = self._btn("Open Dashboard", op_open_dashboard)
         dash_btn.setMinimumHeight(48)  # ~2 rows tall
         outer.addWidget(dash_btn)
+
+        # File actions live in the header (moved out of the old "Task" tab) so Save /
+        # Version Up are always one click away regardless of the active tab.
+        frow = QtWidgets.QHBoxLayout()
+        frow.addWidget(self._btn("Save", op_save))
+        frow.addWidget(self._btn("Version Up", op_save_version))
+        outer.addLayout(frow)
+
         self.task_label = QtWidgets.QLabel("TASK: -")
         self.task_label.setStyleSheet(
             "color: #ffffff; font-weight: bold; font-size: 20px; padding: 4px 0;"
@@ -1285,38 +1657,11 @@ class CGPipelinePanel(QtWidgets.QWidget):
 
         tabs = QtWidgets.QTabWidget()
         outer.addWidget(tabs, 1)
-        tabs.addTab(self._make_task_tab(), "Task")
         tabs.addTab(self._make_model_tab(), "LookDev")
         tabs.addTab(self._make_publish_tab(), "Publish")
         tabs.addTab(self._make_assembly_tab(), "Assembly")
 
     # ---- tabs ----
-    def _make_task_tab(self):
-        w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.setSpacing(6)
-
-        # Status
-        v.addWidget(self._section("Status"))
-        srow = QtWidgets.QHBoxLayout()
-        self.status_combo = QtWidgets.QComboBox()
-        self.status_combo.addItems(["NO CHANGE", "Pending Review", "Approved", "In Progress"])
-        srow.addWidget(self.status_combo, 1)
-        srow.addWidget(self._btn("Update", lambda: op_update_status(self.status_combo.currentText())))
-        v.addLayout(srow)
-        v.addWidget(self._sep())
-
-        # File
-        v.addWidget(self._section("File"))
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self._btn("Save", op_save))
-        row.addWidget(self._btn("Version Up", op_save_version))
-        v.addLayout(row)
-
-        v.addStretch()
-        return self._wrap_scroll(w)
-
     def _make_model_tab(self):
         # The LookDev stage tab: bring in the asset's model, plus texture tools.
         w = QtWidgets.QWidget()
@@ -1356,6 +1701,17 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
+        # Status (moved here from the old "Task" tab) — updates the registry and Kitsu.
+        v.addWidget(self._section("Status"))
+        srow = QtWidgets.QHBoxLayout()
+        self.status_combo = QtWidgets.QComboBox()
+        self.status_combo.addItems(STATUS_CHOICES)
+        srow.addWidget(self.status_combo, 1)
+        srow.addWidget(self._btn("Update", lambda: op_update_status(self.status_combo.currentText())))
+        v.addLayout(srow)
+        v.addWidget(self._sep())
+
+        v.addWidget(self._section("Publish"))
         prow = QtWidgets.QHBoxLayout()
         self.format_combo = QtWidgets.QComboBox()
         self.format_combo.addItems([".abc", ".usd", ".fbx", ".ma"])
@@ -1402,10 +1758,55 @@ class CGPipelinePanel(QtWidgets.QWidget):
         lrow.addWidget(self._btn("Add", self._on_publish_add))
         lrow.addWidget(self._btn("Remove", self._on_publish_remove))
         v.addLayout(lrow)
-        publish_btn = self._btn("PUBLISH", op_publish)
+
+        # Notes / Comment — posted to Kitsu when using "Publish to Kitsu".
+        v.addWidget(self._section("Notes / Comment"))
+        self.notes_edit = QtWidgets.QPlainTextEdit()
+        self.notes_edit.setPlaceholderText(
+            "Comment for this publish (sent to Kitsu on \"Publish to Kitsu\")…")
+        self.notes_edit.setMaximumHeight(70)
+        self.notes_edit.setPlainText(STATE.publish_notes)
+        self.notes_edit.textChanged.connect(
+            lambda: setattr(STATE, "publish_notes", self.notes_edit.toPlainText()))
+        v.addWidget(self.notes_edit)
+
+        # Thumbnail — auto-snapshot on publish, plus a manual snapshot button.
+        self.thumb_chk = QtWidgets.QCheckBox("Auto Thumbnail on Publish")
+        self.thumb_chk.setChecked(STATE.auto_thumbnail)
+        self.thumb_chk.toggled.connect(lambda c: setattr(STATE, "auto_thumbnail", c))
+        v.addWidget(self.thumb_chk)
+        v.addWidget(self._btn("Snapshot Thumbnail", self._on_snapshot_thumb))
+
+        # Publish locally, or publish + push thumbnail/comment to Kitsu.
+        publish_btn = self._btn("PUBLISH", lambda: op_publish(False))
         publish_btn.setStyleSheet("font-weight: bold; padding: 6px;")
         v.addWidget(publish_btn)
+        kitsu_btn = self._btn("PUBLISH TO KITSU", lambda: op_publish(True))
+        kitsu_btn.setStyleSheet("font-weight: bold; padding: 6px; background-color: #2f6f4f;")
+        v.addWidget(kitsu_btn)
+
+        # Clean Up — optimize/cleanup the scene before publishing.
+        v.addWidget(self._sep())
+        cleanup_btn = self._btn("CLEAN UP", self._on_cleanup)
+        cleanup_btn.setToolTip(
+            "Optimize the scene: remove unknown nodes, delete unused nodes, "
+            "merge duplicate shaders, and strip extra UV sets (keep only map1).")
+        v.addWidget(cleanup_btn)
         return self._wrap_scroll(w)
+
+    def _on_snapshot_thumb(self):
+        path, msg = capture_task_thumbnail()
+        if path:
+            print(f"CGPipeline: {msg}")
+            try:
+                cmds.inViewMessage(amg=f"CGPipeline: {msg}", pos="midCenter", fade=True)
+            except Exception:
+                pass
+        else:
+            cmds.warning(f"CGPipeline: {msg}")
+
+    def _on_cleanup(self):
+        op_cleanup_scene()
 
     def _make_assembly_tab(self):
         w = QtWidgets.QWidget()
@@ -1413,26 +1814,43 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
-        v.addWidget(self._section("Assign Lookdev to Cache"))
+        # Cache assignment is a Shot-only workflow (animation caches assigned a lookdev).
+        # On an asset task there are no caches, so this whole block is hidden and a short
+        # note points the user at the "Reference Lookdev into Scene" section below.
+        self.cache_section = QtWidgets.QWidget()
+        cv = QtWidgets.QVBoxLayout(self.cache_section)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(6)
+        cv.addWidget(self._section("Assign Lookdev to Cache"))
         self.cache_tree = QtWidgets.QTreeWidget()
         self.cache_tree.setColumnCount(3)
         self.cache_tree.setHeaderLabels(["Apply", "Cache", "Lookdev"])
         self.cache_tree.itemClicked.connect(self._on_cache_link_clicked)
-        v.addWidget(self.cache_tree, 2)
+        cv.addWidget(self.cache_tree, 2)
 
         self.cache_anim_chk = QtWidgets.QCheckBox("ANIM ONLY")
         self.cache_anim_chk.toggled.connect(self._on_anim_only_changed)
-        v.addWidget(self.cache_anim_chk)
+        cv.addWidget(self.cache_anim_chk)
 
         arow = QtWidgets.QHBoxLayout()
         arow.addWidget(self._btn("APPLY SELECTED", lambda: self._apply_caches(False)))
         arow.addWidget(self._btn("APPLY ALL", lambda: self._apply_caches(True)))
         arow.addWidget(self._btn("CLEAR ALL", self._clear_cache_checks))
-        v.addLayout(arow)
+        cv.addLayout(arow)
+        cv.addWidget(self._sep())
+        v.addWidget(self.cache_section)
+
+        # Shown instead of the cache block on asset tasks.
+        self.cache_assets_note = QtWidgets.QLabel(
+            "Cache assembly is a Shot workflow. On an asset, use "
+            "“Reference Lookdev into Scene” below.")
+        self.cache_assets_note.setWordWrap(True)
+        self.cache_assets_note.setStyleSheet("color: #888888; padding: 4px;")
+        self.cache_assets_note.setVisible(False)   # shown only on asset tasks
+        v.addWidget(self.cache_assets_note)
 
         # Reference lookdev assets directly into the scene (sets, props, or any asset
-        # that isn't driven by an animation cache).
-        v.addWidget(self._sep())
+        # that isn't driven by an animation cache). Works for both shots and assets.
         v.addWidget(self._section("Reference Lookdev into Scene"))
         self.lookdev_ref_tree = QtWidgets.QTreeWidget()
         self.lookdev_ref_tree.setHeaderHidden(True)
@@ -1466,6 +1884,16 @@ class CGPipelinePanel(QtWidgets.QWidget):
 
     def _apply_caches(self, batch):
         op_assembly_apply(batch=batch)
+
+    def _update_assembly_context(self):
+        """Show the cache-assign block only for Shot tasks; on assets show the note and
+        keep just the lookdev-referencing workflow."""
+        is_shot = (_shot_root_from_task_path() is not None) or (STATE.category == "Shots")
+        try:
+            self.cache_section.setVisible(is_shot)
+            self.cache_assets_note.setVisible(not is_shot)
+        except Exception:
+            pass
 
     # ---- state sync ----
     def _entity_task_name(self):
@@ -1578,6 +2006,8 @@ class CGPipelinePanel(QtWidgets.QWidget):
                 leaf.setCheckState(0, QtCore.Qt.Unchecked)   # checkbox beside the name
                 top.addChild(leaf)
             top.setExpanded(True)
+        # Hide the cache-assign block on asset tasks (Shots-only workflow).
+        self._update_assembly_context()
 
     def _on_reference_lookdev(self):
         # Reference the CHECKED assets (the checkbox shows what's selected to bring in).
