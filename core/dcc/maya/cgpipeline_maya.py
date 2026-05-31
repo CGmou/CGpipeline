@@ -969,17 +969,23 @@ def _apply_alembic_to_group(cache_path, grp):
         shading afterwards."""
     grp_long = (cmds.ls(grp, long=True) or [grp])[0]
     cache_fwd = cache_path.replace("\\", "/")
-
-    # Re-apply must SWAP the cache cleanly: drop the previous AlembicNode(s) first.
-    # (Repointing an existing node's file in place silently no-ops when the new cache
-    # differs, which looked like "nothing happens" when picking another cache.)
-    _remove_existing_alembic(grp_long)
     meshes = cmds.listRelatives(grp_long, allDescendents=True, type="mesh", fullPath=True) or []
     if not meshes:
         cmds.warning(f"CGPipeline: No meshes under {grp} to receive the cache.")
         return
 
-    # Single, unambiguous instance: the native merge is safe and preserves shading.
+    # Capture the group's shading UP FRONT so we can reassert it no matter how the
+    # cache import disturbs per-face material assignments. This makes shader survival
+    # independent of which apply path runs below.
+    shading = _capture_shading(meshes)
+
+    # Swap cleanly: drop any previous AlembicNode(s) so re-applying a DIFFERENT cache
+    # actually replaces it (repointing the file in place silently no-ops, which looked
+    # like "nothing happens" when picking another cache).
+    _remove_existing_alembic(grp_long)
+
+    applied = False
+    # Single, unambiguous instance: the native merge binds onto the existing shapes.
     if not _has_duplicate_instances(grp_long):
         before = set(cmds.ls(assemblies=True, long=True) or [])
         try:
@@ -994,22 +1000,25 @@ def _apply_alembic_to_group(cache_path, grp):
                 try: cmds.delete(stray)
                 except Exception: pass
             print(f"CGPipeline: Cache merged onto {grp} (Native Merge).")
-            return
-        # Didn't bind: clean up whatever it imported, then fall through to reconnect.
-        stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
-        if stray:
-            try: cmds.delete(stray)
-            except Exception: pass
+            applied = True
+        else:
+            # Didn't bind: clean up whatever it imported, then fall through to reconnect.
+            stray = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
+            if stray:
+                try: cmds.delete(stray)
+                except Exception: pass
 
-    # Duplicated instance (or native merge didn't bind): scoped per-instance reconnect
-    # with the group's shading captured beforehand and restored after, so the cache
-    # data flowing into .inMesh can't strip the per-face material assignments.
-    shading = _capture_shading(meshes)
-    _apply_alembic_by_reconnect(cache_fwd, grp, grp_long)
+    # Duplicated instance, or native merge didn't bind: scoped per-instance reconnect
+    # (imports once, wires ONLY this group's meshes, deletes the temp geometry).
+    if not applied:
+        _apply_alembic_by_reconnect(cache_fwd, grp, grp_long)
+
+    # Reassert the captured shading. A no-op if nothing was disturbed (e.g. a clean
+    # native merge); the safety net when the .inMesh rewire stripped per-face shaders.
     if shading:
         restored = _restore_shading(shading)
         if restored:
-            print(f"CGPipeline: Restored shading on {restored} shape(s) of {grp}.")
+            print(f"CGPipeline: Reasserted shading on {restored} shape(s) of {grp}.")
 
 
 def _apply_alembic_by_reconnect(cache_path, grp, grp_long):
