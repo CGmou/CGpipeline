@@ -89,6 +89,18 @@ class HubManager:
         self.load_projects()
         self.projects.append(project)
         self.save_projects()
+
+        # Seed the project's registry with the real name so the workspace header and the
+        # DCC panels don't fall back to the default "New Project".
+        try:
+            from .registry import TaskRegistry
+            reg = TaskRegistry(project_path)
+            if reg.data.get("project_name") != name:
+                reg.data["project_name"] = name
+                reg.save()
+        except Exception as e:
+            print(f"CGPipeline: Could not seed registry project_name for '{name}': {e}")
+
         return project
 
     def update_project(self, project_id, **kwargs):

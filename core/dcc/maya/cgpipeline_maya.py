@@ -509,18 +509,32 @@ def _set_task_status(new_status):
 
 
 def _project_name():
-    """Project display name from registry.json, falling back to the project folder name."""
-    if STATE.reg_path and os.path.exists(STATE.reg_path):
+    """Project display name. Prefer the registry's project_name, but when it's still the
+    default placeholder fall back to the authoritative project_index.json entry (matched by
+    path), and finally to the project folder name."""
+    if not STATE.reg_path:
+        return "-"
+    proj_root = os.path.dirname(STATE.reg_path)
+    name = ""
+    if os.path.exists(STATE.reg_path):
         try:
             with open(STATE.reg_path, "r") as f:
-                name = json.load(f).get("project_name", "")
-            if name:
-                return name
+                name = (json.load(f).get("project_name") or "").strip()
         except Exception:
-            pass
-    if STATE.reg_path:
-        return os.path.basename(os.path.dirname(STATE.reg_path)) or "-"
-    return "-"
+            name = ""
+    if name and name not in ("New Project", "Unknown Project"):
+        return name
+    # project_index.json lives in the projects root (the parent of the project folder)
+    # and carries the hub's display name — the same source the dashboard hub uses.
+    index = os.path.join(os.path.dirname(proj_root), "project_index.json")
+    try:
+        with open(index, "r") as f:
+            for p in json.load(f):
+                if os.path.normpath(p.get("path", "")) == os.path.normpath(proj_root) and p.get("name"):
+                    return p["name"]
+    except Exception:
+        pass
+    return name or os.path.basename(proj_root) or "-"
 
 
 # --------------------------------------------------------------------------------------
