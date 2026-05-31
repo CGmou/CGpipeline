@@ -57,7 +57,7 @@ class PipelineState:
     # Assembly
     lookdev_items = []      # [{name, path, asset_name}]
     cache_items = []        # [{name, path}]
-    cache_links = []        # [{cache, lookdev, is_selected}] — cache filename -> lookdev asset
+    collection_links = []   # [{name, assigned_cache, is_selected}]
     cache_anim_only = False
 
 
@@ -844,6 +844,35 @@ def op_import_model(mode="reference"):
 # --------------------------------------------------------------------------------------
 # Operations: Assembly
 # --------------------------------------------------------------------------------------
+def _group_match_token(grp_name):
+    """The name used to match caches to a group, namespace/DAG-path stripped.
+    'woody:CH_Woody' -> 'CH_Woody'."""
+    return grp_name.split("|")[-1].split(":")[-1]
+
+
+def _remove_existing_alembic(grp):
+    """Delete any AlembicNode(s) already driving the meshes under `grp`, so applying
+    a cache replaces the previous one instead of stacking (which bogs Maya down)."""
+    try:
+        meshes = cmds.listRelatives(grp, allDescendents=True, type="mesh", fullPath=True) or []
+    except Exception:
+        meshes = []
+    nodes = set()
+    for m in meshes:
+        for n in (cmds.listHistory(m) or []):
+            try:
+                if cmds.nodeType(n) == "AlembicNode":
+                    nodes.add(n)
+            except Exception:
+                continue
+    if nodes:
+        try:
+            cmds.delete(list(nodes))
+            print(f"CGPipeline: Removed {len(nodes)} old Alembic node(s) on {grp}")
+        except Exception as e:
+            print(f"CGPipeline: Could not remove old Alembic nodes on {grp}: {e}")
+
+
 def _rel_key(full_path, root_long):
     """Namespace-stripped node names below `root_long`, as a tuple. Used to match a
     cache mesh to the corresponding mesh under a target group regardless of
@@ -855,265 +884,57 @@ def _rel_key(full_path, root_long):
     return tuple(p.split(":")[-1] for p in sub.split("|") if p)
 
 
-def _mesh_shapes(root):
-    """Non-intermediate mesh shapes under `root` (full DAG paths)."""
-    out = []
-    for m in (cmds.listRelatives(root, allDescendents=True, type="mesh", fullPath=True) or []):
-        try:
-            if cmds.getAttr(m + ".intermediateObject"):
-                continue
-        except Exception:
-            pass
-        out.append(m)
-    return out
-
-
-def _transfer_shading(src_shape, dst_shape):
-    """Copy the shading-group assignment from src_shape onto dst_shape — both whole-
-    object and per-face. Assumes identical topology (same face indices), so the face
-    component lists transfer directly. dst is fresh cache geometry, so we just assign
-    it to the source's shading groups. Returns True if anything was assigned."""
-    src_long = (cmds.ls(src_shape, long=True) or [src_shape])[0]
-    src_parent = (cmds.listRelatives(src_shape, parent=True, fullPath=True) or [None])[0]
-    own = {src_long, src_parent} - {None}
-    assigned = False
-    for sg in dict.fromkeys(cmds.listConnections(src_shape, type="shadingEngine") or []):
-        comps, whole = [], False
-        for m in (cmds.sets(sg, q=True) or []):
-            node = m.split(".")[0]
-            node_long = cmds.ls(node, long=True) or []
-            if not (node_long and node_long[0] in own):
-                continue
-            if "." in m:
-                comps.append(m.split(".", 1)[1])   # e.g. 'f[0:50]'
-            else:
-                whole = True
-        try:
-            if comps:
-                cmds.sets([dst_shape + "." + c for c in comps], forceElement=sg)
-                assigned = True
-            elif whole:
-                cmds.sets(dst_shape, forceElement=sg)
-                assigned = True
-        except Exception as e:
-            print(f"CGPipeline: shading transfer failed for {sg}: {e}")
-    return assigned
-
-
-def _remove_imported_cache_by_tag(cache_tag):
-    """Delete a previously imported cache tagged with `cache_tag` (its file name), so
-    re-applying the same cache swaps cleanly instead of stacking copies."""
-    for nr in (cmds.ls("*.cgpCacheImport", objectsOnly=True, long=True) or []):
-        try:
-            if cmds.getAttr(nr + ".cgpCacheImport") == cache_tag:
-                cmds.delete(nr)
-        except Exception:
-            pass
-
-
-# Outliner organisation: category groups for renderable assembly geometry, and one
-# hidden group for the lookdev material-source references used for shader transfer.
-LOOKDEV_SHD_GROUP = "_LOOKDEV_SHD_"
-CATEGORY_GROUP_MAP = {
-    "char": "_CHAR_", "character": "_CHAR_", "characters": "_CHAR_",
-    "set": "_SETS_", "sets": "_SETS_", "setdress": "_SETS_",
-    "prop": "_PROPS_", "props": "_PROPS_",
-    "env": "_ENV_", "environment": "_ENV_", "environments": "_ENV_",
-    "veh": "_VEH_", "vehicle": "_VEH_", "vehicles": "_VEH_",
-}
-
-
-def _category_group_name(category):
-    key = (category or "").strip().lower()
-    if key in CATEGORY_GROUP_MAP:
-        return CATEGORY_GROUP_MAP[key]
-    return "_" + (category or "MISC").strip().upper().replace(" ", "_") + "_"
-
-
-def _get_or_make_group(name, hidden=False):
-    """Get (or create) a top-level empty group called `name`."""
-    existing = cmds.ls("|" + name, long=True) or []
-    if existing:
-        return existing[0]
-    g = (cmds.ls(cmds.group(empty=True, world=True, name=name), long=True) or [name])[0]
-    if hidden:
-        try:
-            cmds.setAttr(g + ".visibility", 0)
-        except Exception:
-            pass
-    return g
-
-
-def _parent_under(node, group):
-    """Reparent `node` under `group`, relative (no world compensation, so animated /
-    connected transforms aren't disturbed — the groups are at the origin). Returns the
-    node's resolved path after the move."""
-    try:
-        moved = cmds.parent(node, group, relative=True) or [node]
-        return (cmds.ls(moved[0], long=True) or [moved[0]])[0]
-    except Exception:
-        return node
-
-
-def _ensure_lookdev_referenced(lookdev_item):
-    """Bring the lookdev in ONCE as a shared material source, reusing it if already
-    present (tracked by a tag). IMPORTED (not referenced) so the nodes are clean and
-    un-namespaced; parented immediately under the hidden _LOOKDEV_SHD_ group (which also
-    clears it from the root so a later cache import keeps the clean CH_Woody name). It
-    only provides materials, the caches render. Returns the material-source top groups."""
-    asset = lookdev_item.get("asset_name") or "lkdev"
-    shd = _get_or_make_group(LOOKDEV_SHD_GROUP, hidden=True)
-
-    # Reuse an existing (tagged) material source for this asset.
-    existing = []
-    for c in (cmds.listRelatives(shd, children=True, fullPath=True) or []):
-        try:
-            if cmds.attributeQuery("cgpLookdevSrc", node=c, exists=True) and \
-                    cmds.getAttr(c + ".cgpLookdevSrc") == asset:
-                existing.append(c)
-        except Exception:
-            pass
-    if existing:
-        return existing
-
-    before = set(cmds.ls(assemblies=True, long=True) or [])
-    try:
-        cmds.file(lookdev_item["path"], i=True, ignoreVersion=True,
-                  mergeNamespacesOnClash=True, namespace=":")
-        print(f"CGPipeline: Imported lookdev material source '{asset}'.")
-    except Exception as e:
-        cmds.warning(f"CGPipeline: Lookdev import failed: {e}")
-        return []
-    out = []
-    for r in (set(cmds.ls(assemblies=True, long=True) or []) - before):
-        r2 = _parent_under(r, shd)
-        try:
-            if not cmds.attributeQuery("cgpLookdevSrc", node=r2, exists=True):
-                cmds.addAttr(r2, longName="cgpLookdevSrc", dataType="string")
-            cmds.setAttr(r2 + ".cgpLookdevSrc", asset, type="string")
-            cmds.setAttr(r2 + ".visibility", 0)   # hide material source; caches render
-        except Exception:
-            pass
-        out.append(r2)
-    return out
-
-
-def op_reference_lookdev(lookdev_item):
-    """Bring a lookdev into the scene as VISIBLE geometry — for assets that are NOT
-    driven by an animation cache (sets, props, or any asset to keep as-is). IMPORTED
-    (not referenced) so the nodes are clean and un-namespaced; Maya auto-numbers
-    duplicates (CH_Woody, CH_Woody1, …) with no wrapper. Each instance sits as a direct
-    child of the asset's category group (_CHAR_/_SETS_/_PROPS_…), at the same level as
-    the imported caches."""
-    asset = lookdev_item.get("asset_name") or "lkdev"
-    before = set(cmds.ls(assemblies=True, long=True) or [])
-    try:
-        cmds.file(lookdev_item["path"], i=True, ignoreVersion=True,
-                  mergeNamespacesOnClash=True, namespace=":")
-    except Exception as e:
-        cmds.warning(f"CGPipeline: Import failed: {e}")
+def _apply_alembic_to_group(cache_path, grp):
+    """Apply an Alembic cache onto a SPECIFIC group's existing meshes, isolated per
+    instance so duplicated characters (woody:CH_Woody, woody1:CH_Woody) each get
+    their own cache. Imports the cache fresh, reconnects its AlembicNode outputs to
+    the target group's matching meshes (by namespace-stripped path), then deletes
+    the temporary imported geometry. AbcImport -connect can't do this for
+    duplicates because it matches node names globally."""
+    _remove_existing_alembic(grp)
+    grp_long = (cmds.ls(grp, long=True) or [grp])[0]
+    tgt_map = {}
+    for tm in (cmds.listRelatives(grp_long, allDescendents=True, type="mesh", fullPath=True) or []):
+        tgt_map[_rel_key(tm, grp_long)] = tm
+    if not tgt_map:
+        cmds.warning(f"CGPipeline: No meshes under {grp} to receive the cache.")
         return
-    cat_grp = _get_or_make_group(_category_group_name(lookdev_item.get("category")))
-    for r in (set(cmds.ls(assemblies=True, long=True) or []) - before):
-        _parent_under(r, cat_grp)
-    print(f"CGPipeline: Imported lookdev '{asset}' into scene "
-          f"({_category_group_name(lookdev_item.get('category'))}).")
-
-
-_CACHE_NAME_RE = re.compile(
-    r"^sh\d+_sq\d+_(.+)_f\d+_f\d+\.(abc|usd|usda|usdc|fbx)$", re.IGNORECASE)
-
-
-def _is_object_cache(name):
-    """True only for caches named SH##_SQ####_<object>_<task>_f####_f####.<ext> that
-    INCLUDE an object name. 'sh01_sq0010_anim_f0001_f0024.abc' (object omitted) has a
-    single token between the sequence and the frame range, so it's excluded; an object
-    name adds at least one more '_'-separated token."""
-    m = _CACHE_NAME_RE.match(name)
-    return bool(m) and "_" in m.group(1)
-
-
-def _import_cache_and_shade(cache_path, lookdev_roots, category=""):
-    """Import the alembic cache as its own geometry and copy the lookdev's shaders onto
-    it (whole-object AND per-face). `lookdev_roots` are the referenced lookdev groups
-    used purely as the material source. Topology / UVs / names match, so per-face
-    assignments transfer exactly. The imported cache is parented under its category
-    group (_CHAR_/_SETS_/…) and tagged with its file name so a re-apply replaces it.
-    Returns True on success."""
-    cache_fwd = cache_path.replace("\\", "/")
-    cache_tag = os.path.basename(cache_path)
-
-    look_map = {}
-    for lr in lookdev_roots:
-        for sh in _mesh_shapes(lr):
-            look_map.setdefault(_rel_key(sh, lr), sh)
-    if not look_map:
-        cmds.warning("CGPipeline: Lookdev has no meshes to source shaders from.")
-        return False
-
-    # Clean re-apply: remove a previous import of THIS cache.
-    _remove_imported_cache_by_tag(cache_tag)
 
     before = set(cmds.ls(assemblies=True, long=True) or [])
     try:
-        cmds.AbcImport(cache_fwd, mode="import")
+        cmds.AbcImport(cache_path, mode="import")
     except Exception as e:
-        cmds.warning(f"CGPipeline: AbcImport failed for {cache_tag}: {e}")
-        return False
+        cmds.warning(f"CGPipeline: AbcImport failed: {e}")
+        return
     new_roots = list(set(cmds.ls(assemblies=True, long=True) or []) - before)
     if not new_roots:
-        cmds.warning(f"CGPipeline: Cache produced no geometry: {cache_tag}.")
-        return False
+        cmds.warning("CGPipeline: Cache produced no new geometry to connect.")
+        return
 
-    cat_grp = _get_or_make_group(_category_group_name(category)) if category else None
-    transferred = 0
+    reconnected = 0
     for nr in new_roots:
-        for sh in _mesh_shapes(nr):
-            src = look_map.get(_rel_key(sh, nr))
-            if src and _transfer_shading(src, sh):
-                transferred += 1
-        node = _parent_under(nr, cat_grp) if cat_grp else nr
-        try:
-            if not cmds.attributeQuery("cgpCacheImport", node=node, exists=True):
-                cmds.addAttr(node, longName="cgpCacheImport", dataType="string")
-            cmds.setAttr(node + ".cgpCacheImport", cache_tag, type="string")
-        except Exception:
-            pass
+        for nm in (cmds.listRelatives(nr, allDescendents=True, type="mesh", fullPath=True) or []):
+            tgt = tgt_map.get(_rel_key(nm, nr))
+            if not tgt:
+                continue
+            src = cmds.listConnections(nm + ".inMesh", plugs=True, source=True, destination=False) or []
+            if not src:
+                continue
+            try:
+                cmds.connectAttr(src[0], tgt + ".inMesh", force=True)
+                reconnected += 1
+            except Exception:
+                pass
 
-    if transferred:
-        print(f"CGPipeline: Imported {cache_tag}; copied lookdev shaders to {transferred} shape(s).")
+    if reconnected:
+        for nr in new_roots:
+            try:
+                cmds.delete(nr)  # remove temp geometry; the AlembicNode now drives the target
+            except Exception:
+                pass
+        print(f"CGPipeline: Cache applied to {grp} ({reconnected} meshes).")
     else:
-        cmds.warning(f"CGPipeline: Imported {cache_tag} but matched no shapes to copy shaders onto.")
-    return True
-
-
-def _resolve_cache_path(cache_name):
-    """Full path of a cache file by name: prefer the scan result, else search the
-    shot's dept cache/Publish folders."""
-    p = next((c["path"] for c in STATE.cache_items if c["name"] == cache_name), None)
-    if p and os.path.exists(p):
-        return p
-    shot_root = _shot_root_from_task_path()
-    if shot_root and os.path.isdir(shot_root):
-        for dept in os.listdir(shot_root):
-            for sub in ("cache", "Publish", ""):
-                base = os.path.join(shot_root, dept, sub) if sub else os.path.join(shot_root, dept)
-                test = os.path.normpath(os.path.join(base, cache_name))
-                if os.path.exists(test):
-                    return test
-    return None
-
-
-def _auto_match_lookdev(cache_name):
-    """Best-guess lookdev for a cache: the asset name that appears in the cache file
-    name (e.g. '..._CH_Woody_anim_...' -> a lookdev whose asset is 'CH_Woody')."""
-    cl = cache_name.lower()
-    best = ""
-    for it in STATE.lookdev_items:
-        a = (it.get("asset_name") or "").lower()
-        if a and a in cl and len(a) > len(best):
-            best = it["asset_name"]
-    return best
+        cmds.warning(f"CGPipeline: Could not match cache meshes to {grp}; imported cache kept as-is.")
 
 
 def _shot_root_from_task_path():
@@ -1153,8 +974,7 @@ def op_assembly_scan():
                     fl = f.lower()
                     if "_lkdev" in fl and fl.endswith((".ma", ".mb", ".usd", ".usda", ".usdc")):
                         STATE.lookdev_items.append({
-                            "name": f, "path": os.path.join(pub, f),
-                            "asset_name": asset, "category": cat,
+                            "name": f, "path": os.path.join(pub, f), "asset_name": asset,
                         })
 
     # 2. Caches under <shot_root>/<dept>/{cache,Publish} (and the dept folder itself).
@@ -1172,60 +992,82 @@ def op_assembly_scan():
                     fl = f.lower()
                     if not fl.endswith((".abc", ".usd", ".usda", ".usdc", ".fbx")):
                         continue
-                    # Only object caches: SH##_SQ####_<object>_<task>_f####_f####.
-                    # Skip object-less names like sh01_sq0010_anim_f0001_f0024.abc.
-                    if not _is_object_cache(f):
-                        continue
                     if STATE.cache_anim_only and "_anim_" not in fl:
                         continue
                     if not any(c["name"] == f for c in STATE.cache_items):
                         STATE.cache_items.append({"name": f, "path": os.path.join(scan_dir, f)})
 
-    # 3. Build the Cache -> Lookdev assignment list (preserve existing choices).
-    existing = {l["cache"]: (l.get("lookdev", ""), l.get("is_selected", True)) for l in STATE.cache_links}
-    STATE.cache_links = []
-    for c in STATE.cache_items:
-        if c["name"] in existing:
-            lookdev, sel = existing[c["name"]]
-        else:
-            lookdev, sel = _auto_match_lookdev(c["name"]), True
-        STATE.cache_links.append({"cache": c["name"], "lookdev": lookdev, "is_selected": sel})
+    # 3. Sync collection_links to top-level assemblies in the scene (skip default cameras)
+    existing = {l["name"]: (l["assigned_cache"], l["is_selected"]) for l in STATE.collection_links}
+    STATE.collection_links = []
+    DEFAULT_CAMS = {"persp", "top", "front", "side", "back", "bottom", "left", "right"}
+    for grp in (cmds.ls(assemblies=True) or []):
+        if grp in DEFAULT_CAMS:
+            continue
+        cache, sel = existing.get(grp, ("", True))
+        STATE.collection_links.append({"name": grp, "assigned_cache": cache, "is_selected": sel})
 
     print(f"CGPipeline: Scan complete — {len(STATE.lookdev_items)} lookdev, {len(STATE.cache_items)} caches.")
 
 
-def op_assembly_apply(batch=False):
-    """Import each selected cache and copy its assigned lookdev's shaders onto it. The
-    lookdev is referenced once as a shared material source — multiple caches that use
-    the same lookdev reuse that single reference."""
-    links = STATE.cache_links if batch else [l for l in STATE.cache_links if l.get("is_selected")]
-    if not links:
-        cmds.warning("CGPipeline: No caches to apply — assign a lookdev and tick Apply.")
+def op_import_lookdev(idx):
+    if not (0 <= idx < len(STATE.lookdev_items)):
         return
+    it = STATE.lookdev_items[idx]
+    path = it["path"]
+    ns = it["asset_name"] or "lkdev"
+    try:
+        # Maya references are the equivalent of Blender's library link.
+        cmds.file(path, reference=True, namespace=ns, mergeNamespacesOnClash=False, ignoreVersion=True)
+        print(f"CGPipeline: Referenced lookdev → {path}")
+    except Exception as e:
+        cmds.warning(f"CGPipeline: Reference failed: {e}")
+
+
+def op_assembly_apply(batch=False):
+    shot_root = _shot_root_from_task_path()
+    if not shot_root:
+        cmds.warning("CGPipeline: Apply only works in shot context.")
+        return
+    links = STATE.collection_links if batch else [l for l in STATE.collection_links if l["is_selected"]]
     for l in links:
-        cache_name, lookdev_name = l.get("cache"), l.get("lookdev")
-        if not cache_name:
+        if not l["assigned_cache"]:
             continue
-        if not lookdev_name:
-            print(f"CGPipeline: No lookdev assigned for {cache_name}; skipping.")
-            continue
-        cache_path = _resolve_cache_path(cache_name)
+        # Prefer the path resolved during scan; fall back to searching the dept's
+        # cache/Publish folders.
+        cache_path = next((c["path"] for c in STATE.cache_items
+                           if c["name"] == l["assigned_cache"]), None)
+        if not cache_path or not os.path.exists(cache_path):
+            cache_path = None
+            for dept in os.listdir(shot_root):
+                for sub in ("cache", "Publish", ""):
+                    base = os.path.join(shot_root, dept, sub) if sub else os.path.join(shot_root, dept)
+                    test = os.path.normpath(os.path.join(base, l["assigned_cache"]))
+                    if os.path.exists(test):
+                        cache_path = test
+                        break
+                if cache_path:
+                    break
         if not cache_path:
-            print(f"CGPipeline: Cache not found: {cache_name}")
+            print(f"CGPipeline: Cache not found: {l['assigned_cache']}")
+            continue
+        grp = l["name"]
+        if not cmds.objExists(grp):
+            print(f"CGPipeline: Group not found in scene: {grp}")
             continue
         ext = os.path.splitext(cache_path)[1].lower()
-        if ext != ".abc":
-            cmds.warning(f"CGPipeline: This flow imports .abc caches (got {ext}); skipping {cache_name}.")
-            continue
-        lookdev_item = next((it for it in STATE.lookdev_items if it.get("asset_name") == lookdev_name), None)
-        if not lookdev_item:
-            print(f"CGPipeline: Lookdev not found: {lookdev_name}")
-            continue
-        lookdev_roots = _ensure_lookdev_referenced(lookdev_item)
-        if not lookdev_roots:
-            print(f"CGPipeline: Could not reference lookdev '{lookdev_name}'.")
-            continue
-        _import_cache_and_shade(cache_path, lookdev_roots, lookdev_item.get("category", ""))
+        try:
+            if ext == ".abc":
+                # Per-instance apply: isolates duplicated characters and replaces the
+                # previous cache instead of stacking AlembicNodes.
+                _apply_alembic_to_group(cache_path, grp)
+            elif ext in (".usd", ".usda", ".usdc"):
+                cmds.mayaUSDImport(file=cache_path)
+            elif ext == ".fbx":
+                mel.eval(f'FBXImport -f "{cache_path.replace(chr(92), "/")}";')
+            print(f"CGPipeline: Applied {l['assigned_cache']} → {grp}")
+        except Exception as e:
+            print(f"CGPipeline: Cache apply failed for {grp}: {e}")
 
 
 # --------------------------------------------------------------------------------------
@@ -1413,59 +1255,28 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
-        v.addWidget(self._section("Assign Lookdev to Cache"))
-        self.cache_tree = QtWidgets.QTreeWidget()
-        self.cache_tree.setColumnCount(3)
-        self.cache_tree.setHeaderLabels(["Apply", "Cache", "Lookdev"])
-        self.cache_tree.itemClicked.connect(self._on_cache_link_clicked)
-        v.addWidget(self.cache_tree, 2)
+        v.addWidget(self._btn("1. REFRESH", self._on_assembly_scan))
+        v.addWidget(QtWidgets.QLabel("2. IMPORT LOOKDEV:"))
+        self.lookdev_list_w = QtWidgets.QListWidget()
+        v.addWidget(self.lookdev_list_w, 1)
+        v.addWidget(self._btn("REFERENCE LOOKDEV", self._on_import_lookdev))
+
+        v.addWidget(QtWidgets.QLabel("3. ASSIGN CACHES:"))
+        self.collection_tree = QtWidgets.QTreeWidget()
+        self.collection_tree.setColumnCount(3)
+        self.collection_tree.setHeaderLabels(["Apply", "Group", "Cache"])
+        self.collection_tree.itemClicked.connect(self._on_link_clicked)
+        v.addWidget(self.collection_tree, 1)
 
         self.cache_anim_chk = QtWidgets.QCheckBox("ANIM ONLY")
         self.cache_anim_chk.toggled.connect(self._on_anim_only_changed)
         v.addWidget(self.cache_anim_chk)
 
         arow = QtWidgets.QHBoxLayout()
-        arow.addWidget(self._btn("APPLY SELECTED", lambda: self._apply_caches(False)))
-        arow.addWidget(self._btn("APPLY ALL", lambda: self._apply_caches(True)))
-        arow.addWidget(self._btn("CLEAR ALL", self._clear_cache_checks))
+        arow.addWidget(self._btn("APPLY SELECTED", lambda: op_assembly_apply(batch=False)))
+        arow.addWidget(self._btn("APPLY ALL", lambda: op_assembly_apply(batch=True)))
         v.addLayout(arow)
-
-        # Reference lookdev assets directly into the scene (sets, props, or any asset
-        # that isn't driven by an animation cache).
-        v.addWidget(self._sep())
-        v.addWidget(self._section("Reference Lookdev into Scene"))
-        self.lookdev_ref_tree = QtWidgets.QTreeWidget()
-        self.lookdev_ref_tree.setHeaderHidden(True)
-        self.lookdev_ref_tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-        v.addWidget(self.lookdev_ref_tree, 1)
-        rrow = QtWidgets.QHBoxLayout()
-        rrow.addWidget(self._btn("REFERENCE SELECTED", self._on_reference_lookdev))
-        rrow.addWidget(self._btn("CLEAR ALL", self._clear_ref_checks))
-        v.addLayout(rrow)
-
-        # Refresh rescans and rebuilds BOTH lists above.
-        v.addWidget(self._sep())
-        v.addWidget(self._btn("REFRESH", self._on_assembly_scan))
         return self._wrap_scroll(w)
-
-    def _clear_cache_checks(self):
-        """Untick every cache in the Assign-Lookdev list."""
-        for l in STATE.cache_links:
-            l["is_selected"] = False
-        root = self.cache_tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            root.child(i).setText(0, "")
-
-    def _clear_ref_checks(self):
-        """Uncheck every asset in the Reference-Lookdev list."""
-        root = self.lookdev_ref_tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            cat = root.child(i)
-            for j in range(cat.childCount()):
-                cat.child(j).setCheckState(0, QtCore.Qt.Unchecked)
-
-    def _apply_caches(self, batch):
-        op_assembly_apply(batch=batch)
 
     # ---- state sync ----
     def _entity_task_name(self):
@@ -1547,93 +1358,59 @@ class CGPipelinePanel(QtWidgets.QWidget):
 
     def _on_assembly_scan(self):
         op_assembly_scan()
-        self.cache_tree.clear()
-        for l in STATE.cache_links:
+        self.lookdev_list_w.clear()
+        for it in STATE.lookdev_items:
+            self.lookdev_list_w.addItem(it["asset_name"])
+        self.collection_tree.clear()
+        for l in STATE.collection_links:
             item = QtWidgets.QTreeWidgetItem([
                 "✓" if l["is_selected"] else "",
-                l["cache"],
-                l["lookdev"] or "(pick lookdev)",
+                l["name"],
+                l["assigned_cache"] or "(none)",
             ])
-            self.cache_tree.addTopLevelItem(item)
+            self.collection_tree.addTopLevelItem(item)
         for c in range(3):
-            self.cache_tree.resizeColumnToContents(c)
-        # Lookdev assets available to reference directly into the scene, grouped by
-        # category (Character / Sets / Props / …) for easier reading.
-        self.lookdev_ref_tree.clear()
-        by_cat, seen = {}, set()
-        for it in STATE.lookdev_items:
-            a = it.get("asset_name") or ""
-            if not a or a in seen:
-                continue
-            seen.add(a)
-            by_cat.setdefault(it.get("category") or "Misc", []).append(a)
-        for cat in sorted(by_cat):
-            top = QtWidgets.QTreeWidgetItem([cat])
-            top.setFlags(QtCore.Qt.ItemIsEnabled)   # category header: not checkable
-            self.lookdev_ref_tree.addTopLevelItem(top)
-            for a in sorted(by_cat[cat]):
-                leaf = QtWidgets.QTreeWidgetItem([a])
-                leaf.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled
-                              | QtCore.Qt.ItemIsSelectable)
-                leaf.setCheckState(0, QtCore.Qt.Unchecked)   # checkbox beside the name
-                top.addChild(leaf)
-            top.setExpanded(True)
+            self.collection_tree.resizeColumnToContents(c)
 
-    def _on_reference_lookdev(self):
-        # Reference the CHECKED assets (the checkbox shows what's selected to bring in).
-        assets = []
-        root = self.lookdev_ref_tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            cat_item = root.child(i)
-            for j in range(cat_item.childCount()):
-                leaf = cat_item.child(j)
-                if leaf.checkState(0) == QtCore.Qt.Checked:
-                    assets.append(leaf.text(0))
-        if not assets:
-            cmds.warning("CGPipeline: Tick a lookdev asset to reference.")
+    def _on_import_lookdev(self):
+        idx = self.lookdev_list_w.currentRow()
+        if idx < 0:
+            cmds.warning("CGPipeline: Select a lookdev item first.")
             return
-        for a in assets:
-            it = next((x for x in STATE.lookdev_items if x.get("asset_name") == a), None)
-            if it:
-                op_reference_lookdev(it)
+        op_import_lookdev(idx)
+        self._on_assembly_scan()
 
-    def _on_cache_link_clicked(self, item, col):
-        idx = self.cache_tree.indexOfTopLevelItem(item)
+    def _on_link_clicked(self, item, col):
+        idx = self.collection_tree.indexOfTopLevelItem(item)
         if idx < 0:
             return
         if col == 0:
-            STATE.cache_links[idx]["is_selected"] = not STATE.cache_links[idx]["is_selected"]
-            item.setText(0, "✓" if STATE.cache_links[idx]["is_selected"] else "")
+            STATE.collection_links[idx]["is_selected"] = not STATE.collection_links[idx]["is_selected"]
+            item.setText(0, "✓" if STATE.collection_links[idx]["is_selected"] else "")
             return
         if col != 2:
             return
-        # Pick which lookdev's material to copy onto this cache. The guessed match (by
-        # asset name in the cache file) is offered first.
-        guess = _auto_match_lookdev(STATE.cache_links[idx]["cache"])
-        names = []
-        for it in STATE.lookdev_items:
-            a = it.get("asset_name") or ""
-            if a and a not in names:
-                names.append(a)
-        names.sort(key=lambda a: (a != guess, a.lower()))   # guessed match on top
+        # Show only caches whose name matches this group (namespace ignored), e.g.
+        # group 'woody:CH_Woody' -> token 'CH_Woody' -> only *_CH_Woody_* caches.
+        token = _group_match_token(STATE.collection_links[idx]["name"]).lower()
+        matches = [c for c in STATE.cache_items if token and token in c["name"].lower()]
         menu = QtWidgets.QMenu(self)
         none_act = menu.addAction("(none)")
         menu.addSeparator()
         acts = {}
-        for a in names:
-            label = f"{a}  ⟵ match" if a == guess else a
-            acts[menu.addAction(label)] = a
-        if not names:
-            na = menu.addAction("(no lookdev publishes found)")
+        for c in matches:
+            acts[menu.addAction(c["name"])] = c["name"]
+        if not matches:
+            na = menu.addAction(f"(no caches for {token})")
             na.setEnabled(False)
         chosen = menu.exec_(QtGui.QCursor.pos())
         if chosen is None:
             return
         if chosen is none_act:
-            STATE.cache_links[idx]["lookdev"] = ""
-            item.setText(2, "(pick lookdev)")
+            STATE.collection_links[idx]["assigned_cache"] = ""
+            item.setText(2, "(none)")
         elif chosen in acts:
-            STATE.cache_links[idx]["lookdev"] = acts[chosen]
+            STATE.collection_links[idx]["assigned_cache"] = acts[chosen]
             item.setText(2, acts[chosen])
 
 
