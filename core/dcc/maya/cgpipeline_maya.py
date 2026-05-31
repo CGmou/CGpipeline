@@ -996,22 +996,26 @@ def _ensure_lookdev_referenced(lookdev_item):
 
 def op_reference_lookdev(lookdev_item):
     """Reference a lookdev into the scene as VISIBLE geometry — for assets that are NOT
-    driven by an animation cache (sets, props, or any asset to keep as-is). Allows
-    multiple instances (Maya auto-numbers the namespace). The result is parented under
-    the asset's category group (_CHAR_/_SETS_/_PROPS_…)."""
-    ns = lookdev_item.get("asset_name") or "lkdev"
+    driven by an animation cache (sets, props, or any asset to keep as-is). Merges into
+    the current (selected) namespace — the root by default — so the nodes come in with
+    NO 'asset:' prefix. The result is parented under the asset's category group
+    (_CHAR_/_SETS_/_PROPS_…)."""
+    asset = lookdev_item.get("asset_name") or "lkdev"
+    cur_ns = cmds.namespaceInfo(currentNamespace=True) or ":"
     before = set(cmds.ls(assemblies=True, long=True) or [])
     try:
-        cmds.file(lookdev_item["path"], reference=True, namespace=ns,
-                  mergeNamespacesOnClash=False, ignoreVersion=True)
+        # Merge into selected namespace (no dedicated asset namespace). On a name clash
+        # Maya auto-suffixes, so referencing the same asset twice still works.
+        cmds.file(lookdev_item["path"], reference=True,
+                  mergeNamespacesOnClash=True, namespace=cur_ns, ignoreVersion=True)
     except Exception as e:
         cmds.warning(f"CGPipeline: Reference failed: {e}")
         return
     cat_grp = _get_or_make_group(_category_group_name(lookdev_item.get("category")))
     for r in (set(cmds.ls(assemblies=True, long=True) or []) - before):
         _parent_under(r, cat_grp)
-    print(f"CGPipeline: Referenced lookdev '{ns}' into scene "
-          f"({_category_group_name(lookdev_item.get('category'))}).")
+    print(f"CGPipeline: Referenced lookdev '{asset}' into scene "
+          f"({_category_group_name(lookdev_item.get('category'))}, merged namespace).")
 
 
 _CACHE_NAME_RE = re.compile(
