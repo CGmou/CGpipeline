@@ -979,10 +979,10 @@ def _apply_alembic_to_group(cache_path, grp):
     # independent of which apply path runs below.
     shading = _capture_shading(meshes)
 
-    # Swap cleanly: drop any previous AlembicNode(s) so re-applying a DIFFERENT cache
-    # actually replaces it (repointing the file in place silently no-ops, which looked
-    # like "nothing happens" when picking another cache).
-    _remove_existing_alembic(grp_long)
+    # NOTE: auto-removal of existing AlembicNode(s) is disabled for now (experiment) —
+    # deleting the node before applying appears to break shaders on a second identical
+    # model. Trade-off while this is off: re-applying may stack AlembicNodes.
+    # _remove_existing_alembic(grp_long)
 
     applied = False
     # Single, unambiguous instance: the native merge binds onto the existing shapes.
