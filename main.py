@@ -277,6 +277,21 @@ class CGPipelineApp(QMainWindow):
         self.auth.save_active_project(project_data["path"])
         self.workspace_view = WorkspaceView(project_data["path"], self.auth)
         
+        # Sync the project name from the hub (the authoritative source — project_index.json)
+        # into the registry, which historically was left at the default "New Project".
+        # The header reads the name from the registry, so without this it shows the
+        # placeholder even though the hub shows the right name.
+        hub_name = project_data.get("name")
+        reg_name = self.workspace_view.registry.data.get("project_name", "")
+        if hub_name and reg_name != hub_name:
+            # Don't clobber a real registry name with the bare folder-name fallback that
+            # _open_project_by_path builds when there's no hub entry (those have no "id").
+            is_fallback = project_data.get("id") is None
+            if not is_fallback or reg_name in ("", "New Project", "Unknown Project"):
+                self.workspace_view.registry.data["project_name"] = hub_name
+                self.workspace_view.registry.save()
+                self.workspace_view.header.project_name.setText(hub_name)
+
         # Sync color management from hub to registry if needed
         if "color_management" in project_data:
             self.workspace_view.registry.data["color_management"] = project_data["color_management"]

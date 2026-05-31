@@ -277,6 +277,11 @@ class KitsuManager:
         registry = TaskRegistry(project["path"])
         if current_user:
             registry.current_user = current_user
+        # Keep the registry's display name in sync with the Kitsu project name (it
+        # otherwise stays at the default "New Project").
+        if registry.data.get("project_name") != name:
+            registry.data["project_name"] = name
+            registry.save()
 
         # Thumbnails: pull the project avatar + per-entity previews from Kitsu.
         thumbs_dir = os.path.join(project["path"], ".thumbnails")

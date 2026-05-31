@@ -3,7 +3,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QColor, QAction
 import os
 from core.utils import get_latest_version, build_work_filename, get_placeholder_thumbnail
-from core.constants import STATUS_COLORS
+from core.constants import STATUS_COLORS, short_status
 
 class TaskCard(QFrame):
     clicked = Signal(str)
@@ -113,8 +113,9 @@ class TaskCard(QFrame):
 
             row_layout.addStretch()
 
-            t_status = QLabel(task_obj["status"])
+            t_status = QLabel(short_status(task_obj["status"]))
             t_status.setObjectName("TaskStatus")
+            t_status.setToolTip(task_obj["status"])   # full name on hover
             status_color = STATUS_COLORS.get(task_obj["status"])
             if status_color:
                 t_status.setStyleSheet(f"color: {status_color};")

@@ -7,7 +7,7 @@ reads the saved Kitsu credentials from the CGPipeline settings.
 Usage:
     python core/kitsu_sync.py --registry <registry.json> --entity <name>
         --category Assets|Shots --task-type <CGPipeline task type>
-        [--status <status>] [--thumbnail <image.png>]
+        [--status <status>] [--thumbnail <image.png>] [--comment <text>]
 
 Silent no-op (exit 0) when not connectable, not linked, or anything is missing —
 it must never disrupt the DCC.
@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--task-type", dest="task_type", required=True)
     ap.add_argument("--status", default="")
     ap.add_argument("--thumbnail", default="")
+    ap.add_argument("--comment", default="")
     args = ap.parse_args()
 
     if not KitsuManager.available():
@@ -126,13 +127,17 @@ def main():
         _log(f"task '{kitsu_tt_name}' not found on '{args.entity}'; skipping.")
         return 0
 
+    # The user's publish note (if any) is reused as the Kitsu comment text so the
+    # status change / preview is annotated with what they typed.
+    note = args.comment.strip()
+
     # --- Status ---
     status_obj = None
     if args.status:
         try:
             status_obj = gazu.task.get_task_status_by_name(args.status)
             if status_obj:
-                gazu.task.add_comment(task, status_obj, "Status updated from CGPipeline")
+                gazu.task.add_comment(task, status_obj, note or "Status updated from CGPipeline")
                 _log(f"status -> {args.status}")
             else:
                 _log(f"Kitsu has no status named '{args.status}'.")
@@ -146,12 +151,12 @@ def main():
             # make a neutral comment with the task's current status.
             comment = None
             if status_obj:
-                comment = gazu.task.add_comment(task, status_obj, "CGPipeline thumbnail")
+                comment = gazu.task.add_comment(task, status_obj, note or "CGPipeline thumbnail")
             else:
                 try:
                     full = gazu.task.get_task(task["id"])
                     cur = gazu.task.get_task_status(full["task_status_id"])
-                    comment = gazu.task.add_comment(task, cur, "CGPipeline thumbnail")
+                    comment = gazu.task.add_comment(task, cur, note or "CGPipeline thumbnail")
                 except Exception:
                     comment = None
             if comment:
@@ -165,6 +170,18 @@ def main():
                 _log("could not create a comment to attach the preview.")
         except Exception as e:
             _log(f"thumbnail upload failed: {e}")
+
+    # --- Standalone comment ---
+    # Only when there's a note but nothing above already carried it (no status change,
+    # no thumbnail). Posts the note against the task's current status.
+    elif note and not args.status:
+        try:
+            full = gazu.task.get_task(task["id"])
+            cur = gazu.task.get_task_status(full["task_status_id"])
+            gazu.task.add_comment(task, cur, note)
+            _log("comment posted to Kitsu.")
+        except Exception as e:
+            _log(f"comment post failed: {e}")
 
     return 0
 
