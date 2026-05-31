@@ -912,11 +912,13 @@ def _remove_imported_cache_by_tag(cache_tag):
 
 
 def _ensure_lookdev_referenced(lookdev_item):
-    """Reference the lookdev ONCE (namespace = asset name) as a shared material source,
-    reusing it if already present. The lookdev geometry is hidden — it only provides
-    materials; the animated caches are what render. Returns the lookdev's top group
-    DAG paths (shader source), or [] on failure."""
-    ns = lookdev_item.get("asset_name") or "lkdev"
+    """Reference the lookdev ONCE as a shared material source, reusing it if already
+    present. Uses a dedicated 'MTL_<asset>' namespace (kept separate from a direct
+    'Reference Lookdev into Scene' which uses the plain asset namespace), and the
+    geometry is hidden — it only provides materials; the animated caches render.
+    Returns the lookdev's top group DAG paths (shader source), or [] on failure."""
+    asset = lookdev_item.get("asset_name") or "lkdev"
+    ns = "MTL_" + asset
 
     def _roots():
         return [t for t in (cmds.ls(assemblies=True, long=True) or [])
@@ -928,7 +930,7 @@ def _ensure_lookdev_referenced(lookdev_item):
     try:
         cmds.file(lookdev_item["path"], reference=True, namespace=ns,
                   mergeNamespacesOnClash=False, ignoreVersion=True)
-        print(f"CGPipeline: Referenced lookdev '{ns}' (material source).")
+        print(f"CGPipeline: Referenced lookdev material source '{ns}'.")
     except Exception as e:
         cmds.warning(f"CGPipeline: Lookdev reference failed: {e}")
         return []
@@ -939,6 +941,32 @@ def _ensure_lookdev_referenced(lookdev_item):
         except Exception:
             pass
     return roots
+
+
+def op_reference_lookdev(lookdev_item):
+    """Reference a lookdev into the scene as VISIBLE geometry — for assets that are NOT
+    driven by an animation cache (sets, props, or any asset to keep as-is). Allows
+    multiple instances (Maya auto-numbers the namespace)."""
+    ns = lookdev_item.get("asset_name") or "lkdev"
+    try:
+        cmds.file(lookdev_item["path"], reference=True, namespace=ns,
+                  mergeNamespacesOnClash=False, ignoreVersion=True)
+        print(f"CGPipeline: Referenced lookdev '{ns}' into scene.")
+    except Exception as e:
+        cmds.warning(f"CGPipeline: Reference failed: {e}")
+
+
+_CACHE_NAME_RE = re.compile(
+    r"^sh\d+_sq\d+_(.+)_f\d+_f\d+\.(abc|usd|usda|usdc|fbx)$", re.IGNORECASE)
+
+
+def _is_object_cache(name):
+    """True only for caches named SH##_SQ####_<object>_<task>_f####_f####.<ext> that
+    INCLUDE an object name. 'sh01_sq0010_anim_f0001_f0024.abc' (object omitted) has a
+    single token between the sequence and the frame range, so it's excluded; an object
+    name adds at least one more '_'-separated token."""
+    m = _CACHE_NAME_RE.match(name)
+    return bool(m) and "_" in m.group(1)
 
 
 def _import_cache_and_shade(cache_path, lookdev_roots):
@@ -1075,6 +1103,10 @@ def op_assembly_scan():
                 for f in os.listdir(scan_dir):
                     fl = f.lower()
                     if not fl.endswith((".abc", ".usd", ".usda", ".usdc", ".fbx")):
+                        continue
+                    # Only object caches: SH##_SQ####_<object>_<task>_f####_f####.
+                    # Skip object-less names like sh01_sq0010_anim_f0001_f0024.abc.
+                    if not _is_object_cache(f):
                         continue
                     if STATE.cache_anim_only and "_anim_" not in fl:
                         continue
@@ -1313,14 +1345,12 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
-        v.addWidget(self._btn("1. REFRESH", self._on_assembly_scan))
-
-        v.addWidget(QtWidgets.QLabel("2. ASSIGN LOOKDEV TO CACHE:"))
+        v.addWidget(self._section("Assign Lookdev to Cache"))
         self.cache_tree = QtWidgets.QTreeWidget()
         self.cache_tree.setColumnCount(3)
         self.cache_tree.setHeaderLabels(["Apply", "Cache", "Lookdev"])
         self.cache_tree.itemClicked.connect(self._on_cache_link_clicked)
-        v.addWidget(self.cache_tree, 1)
+        v.addWidget(self.cache_tree, 2)
 
         self.cache_anim_chk = QtWidgets.QCheckBox("ANIM ONLY")
         self.cache_anim_chk.toggled.connect(self._on_anim_only_changed)
@@ -1330,6 +1360,18 @@ class CGPipelinePanel(QtWidgets.QWidget):
         arow.addWidget(self._btn("APPLY SELECTED", lambda: self._apply_caches(False)))
         arow.addWidget(self._btn("APPLY ALL", lambda: self._apply_caches(True)))
         v.addLayout(arow)
+
+        # Reference lookdev assets directly into the scene (sets, props, or any asset
+        # that isn't driven by an animation cache).
+        v.addWidget(self._sep())
+        v.addWidget(self._section("Reference Lookdev into Scene"))
+        self.lookdev_ref_list = QtWidgets.QListWidget()
+        self.lookdev_ref_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        v.addWidget(self.lookdev_ref_list, 1)
+        v.addWidget(self._btn("REFERENCE SELECTED", self._on_reference_lookdev))
+
+        v.addWidget(self._sep())
+        v.addWidget(self._btn("REFRESH", self._on_assembly_scan))
         return self._wrap_scroll(w)
 
     def _apply_caches(self, batch):
@@ -1425,6 +1467,25 @@ class CGPipelinePanel(QtWidgets.QWidget):
             self.cache_tree.addTopLevelItem(item)
         for c in range(3):
             self.cache_tree.resizeColumnToContents(c)
+        # Lookdev assets available to reference directly into the scene.
+        self.lookdev_ref_list.clear()
+        seen = set()
+        for it in STATE.lookdev_items:
+            a = it.get("asset_name") or ""
+            if a and a not in seen:
+                seen.add(a)
+                self.lookdev_ref_list.addItem(a)
+
+    def _on_reference_lookdev(self):
+        rows = self.lookdev_ref_list.selectedItems()
+        if not rows:
+            cmds.warning("CGPipeline: Select a lookdev to reference.")
+            return
+        for w in rows:
+            asset = w.text()
+            it = next((x for x in STATE.lookdev_items if x.get("asset_name") == asset), None)
+            if it:
+                op_reference_lookdev(it)
 
     def _on_cache_link_clicked(self, item, col):
         idx = self.cache_tree.indexOfTopLevelItem(item)
