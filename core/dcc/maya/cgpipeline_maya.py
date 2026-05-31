@@ -945,10 +945,13 @@ def _restore_shading(data):
             if not members:
                 continue
             try:
-                cmds.sets(members, e=True, forceElement=sg)
+                # forceElement assigns the components to the shading group. It must
+                # NOT be combined with edit=True (that errors), which previously made
+                # this silently no-op and left the per-face shaders broken.
+                cmds.sets(members, forceElement=sg)
                 ok = True
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"CGPipeline: shading restore failed for {sg}: {e}")
         if ok:
             touched += 1
     return touched
@@ -978,6 +981,8 @@ def _apply_alembic_to_group(cache_path, grp):
     # cache import disturbs per-face material assignments. This makes shader survival
     # independent of which apply path runs below.
     shading = _capture_shading(meshes)
+    n_assign = sum(len(a) for _, a in shading)
+    print(f"CGPipeline: Captured shading for {len(shading)} shape(s), {n_assign} assignment(s) on {grp}.")
 
     # NOTE: auto-removal of existing AlembicNode(s) is disabled for now (experiment) —
     # deleting the node before applying appears to break shaders on a second identical
