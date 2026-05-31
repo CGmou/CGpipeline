@@ -1383,7 +1383,7 @@ def _apply_render_settings():
         cmds.setAttr("defaultResolution.pixelAspect", 1.0)
     except Exception:
         pass
-    # Frame range + naming → <RenderLayer>/<RenderLayer>.<entity>.####.ext
+    # Frame range + naming → <RenderLayer>/<RenderLayer>.####.ext
     try:
         cmds.setAttr("defaultRenderGlobals.animation", 1 if s != e else 0)
         cmds.setAttr("defaultRenderGlobals.startFrame", s)
@@ -1395,7 +1395,9 @@ def _apply_render_settings():
         cmds.setAttr("defaultRenderGlobals.periodInExt", 1)   # name.#.ext
     except Exception:
         pass
-    prefix = f"<RenderLayer>/<RenderLayer>.{STATE.entity or 'render'}"
+    # The versioned Render/<task>_v### folder already identifies the shot, so the prefix
+    # is just <RenderLayer>/<RenderLayer> → <RenderLayer>/<RenderLayer>.####.ext.
+    prefix = "<RenderLayer>/<RenderLayer>"
     try:
         cmds.setAttr("defaultRenderGlobals.imageFilePrefix", prefix, type="string")
     except Exception:
@@ -1460,7 +1462,7 @@ def op_render():
     cmd += ["-x", str(int(STATE.render_res_w)), "-y", str(int(STATE.render_res_h))]
     if rdir:
         cmd += ["-rd", rdir]
-    cmd += ["-im", f"<RenderLayer>/<RenderLayer>.{STATE.entity or 'render'}"]
+    cmd += ["-im", "<RenderLayer>/<RenderLayer>"]
     if STATE.reg_path:
         cmd += ["-proj", os.path.dirname(STATE.reg_path)]
     cmd += [fp]
@@ -2162,17 +2164,6 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
-        # Status — applied automatically on Publish (no separate Update button). Leave it
-        # on "NO CHANGE" to keep the current status.
-        v.addWidget(self._section("Status"))
-        self.status_combo = QtWidgets.QComboBox()
-        self.status_combo.addItems(STATUS_CHOICES)
-        self.status_combo.setCurrentText(STATE.publish_status)
-        self.status_combo.currentTextChanged.connect(
-            lambda t: setattr(STATE, "publish_status", t))
-        v.addWidget(self.status_combo)
-        v.addWidget(self._sep())
-
         v.addWidget(self._section("Publish"))
         prow = QtWidgets.QHBoxLayout()
         self.format_combo = QtWidgets.QComboBox()
@@ -2226,14 +2217,11 @@ class CGPipelinePanel(QtWidgets.QWidget):
         opts.addStretch()
         v.addLayout(opts)
 
-        # Additional Alembic export settings.
-        opts2 = QtWidgets.QHBoxLayout()
+        # Additional Alembic export settings (full-width button, like Clean Up).
         add_btn = self._btn("Additional…", self._open_additional_dialog)
         add_btn.setToolTip("Alembic export options: UV Write, World Space, Write "
                            "Visibility, Write UV Sets, and Step.")
-        opts2.addWidget(add_btn)
-        opts2.addStretch()
-        v.addLayout(opts2)
+        v.addWidget(add_btn)
 
         v.addWidget(QtWidgets.QLabel("Selection List:"))
         self.publish_list_w = QtWidgets.QListWidget()
@@ -2250,6 +2238,16 @@ class CGPipelinePanel(QtWidgets.QWidget):
         v.addLayout(lrow)
         # Reflect any pre-set Whole Scene state on the list controls.
         self._on_whole_scene_changed(STATE.publish_whole_scene)
+
+        # Status — applied automatically on Publish (no separate Update button). Grouped
+        # with the publish controls (no divider). "NO CHANGE" keeps the current status.
+        v.addWidget(self._section("Status"))
+        self.status_combo = QtWidgets.QComboBox()
+        self.status_combo.addItems(STATUS_CHOICES)
+        self.status_combo.setCurrentText(STATE.publish_status)
+        self.status_combo.currentTextChanged.connect(
+            lambda t: setattr(STATE, "publish_status", t))
+        v.addWidget(self.status_combo)
 
         # Notes / Comment — posted to Kitsu when using "Publish to Kitsu".
         v.addWidget(self._section("Notes / Comment"))
