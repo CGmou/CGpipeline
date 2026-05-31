@@ -1427,6 +1427,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         arow = QtWidgets.QHBoxLayout()
         arow.addWidget(self._btn("APPLY SELECTED", lambda: self._apply_caches(False)))
         arow.addWidget(self._btn("APPLY ALL", lambda: self._apply_caches(True)))
+        arow.addWidget(self._btn("CLEAR ALL", self._clear_cache_checks))
         v.addLayout(arow)
 
         # Reference lookdev assets directly into the scene (sets, props, or any asset
@@ -1437,11 +1438,31 @@ class CGPipelinePanel(QtWidgets.QWidget):
         self.lookdev_ref_tree.setHeaderHidden(True)
         self.lookdev_ref_tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         v.addWidget(self.lookdev_ref_tree, 1)
-        v.addWidget(self._btn("REFERENCE SELECTED", self._on_reference_lookdev))
+        rrow = QtWidgets.QHBoxLayout()
+        rrow.addWidget(self._btn("REFERENCE SELECTED", self._on_reference_lookdev))
+        rrow.addWidget(self._btn("CLEAR ALL", self._clear_ref_checks))
+        v.addLayout(rrow)
 
+        # Refresh rescans and rebuilds BOTH lists above.
         v.addWidget(self._sep())
         v.addWidget(self._btn("REFRESH", self._on_assembly_scan))
         return self._wrap_scroll(w)
+
+    def _clear_cache_checks(self):
+        """Untick every cache in the Assign-Lookdev list."""
+        for l in STATE.cache_links:
+            l["is_selected"] = False
+        root = self.cache_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            root.child(i).setText(0, "")
+
+    def _clear_ref_checks(self):
+        """Uncheck every asset in the Reference-Lookdev list."""
+        root = self.lookdev_ref_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            cat = root.child(i)
+            for j in range(cat.childCount()):
+                cat.child(j).setCheckState(0, QtCore.Qt.Unchecked)
 
     def _apply_caches(self, batch):
         op_assembly_apply(batch=batch)
