@@ -88,7 +88,7 @@ class PipelineState:
     render_res_w = 1920
     render_res_h = 1080
     render_layer = ""
-    render_format = "exr"
+    render_format = "png"
 
     # Assembly
     lookdev_items = []      # [{name, path, asset_name}]
@@ -1404,6 +1404,7 @@ def _apply_render_settings():
         pass
     if STATE.render_camera:
         _set_renderable_camera(STATE.render_camera)
+    _set_renderable_layer(STATE.render_layer)
     _set_image_format(STATE.render_format)
     # Output directory → the versioned Render folder. Set as the session 'images' rule
     # (not persisted) so a Maya-UI render lands there too; the batch render also gets it
@@ -1418,24 +1419,30 @@ def _apply_render_settings():
     return rdir, s, e
 
 
-def _layer_for_cmd(layer):
-    """Translate the UI layer name to what the Render command expects."""
-    return "defaultRenderLayer" if layer in ("", "masterLayer", "defaultRenderLayer") else layer
+def _set_renderable_layer(layer):
+    """Make `layer` the only renderable render layer (so the batch render writes just it).
+    'masterLayer'/'' maps to defaultRenderLayer."""
+    target = "defaultRenderLayer" if layer in ("", "masterLayer", "defaultRenderLayer") else layer
+    for rl in (cmds.ls(type="renderLayer") or []):
+        try:
+            cmds.setAttr(rl + ".renderable", 1 if rl == target else 0)
+        except Exception:
+            pass
 
 
-def _find_render_exe():
-    """The standalone Render(.exe) that ships next to maya(.exe)."""
-    name = "Render.exe" if os.name == "nt" else "Render"
+def _find_mayabatch_exe():
+    """mayabatch(.exe) — Maya in batch mode — next to maya(.exe)."""
+    name = "mayabatch.exe" if os.name == "nt" else "maya"
     cand = os.path.join(os.path.dirname(sys.executable), name)
     if os.path.exists(cand):
         return cand
-    return shutil.which("Render")
+    return shutil.which("mayabatch") or shutil.which("maya")
 
 
 def op_render():
-    """Apply the Render-tab settings, save the scene, and launch a standalone batch
-    render into <entity_root>/Render/<task>_v###. Uses the scene's own renderer (-r file)
-    with the tab's frame range / camera / layer / resolution as overrides."""
+    """Apply the Render-tab settings, save the scene, and launch a mayabatch batch render
+    into <entity_root>/Render/<task>_v###. mayabatch opens the saved scene and runs
+    `renderSequence` over the frame range using the scene's renderer + settings."""
     rdir, s, e = _apply_render_settings()
     fp = cmds.file(q=True, sceneName=True)
     if not fp:
@@ -1446,37 +1453,44 @@ def op_render():
     except Exception as ex:
         print(f"CGPipeline: Could not save before render: {ex}")
 
-    render_exe = _find_render_exe()
-    if not render_exe:
+    mayabatch = _find_mayabatch_exe()
+    if not mayabatch:
         cmds.confirmDialog(
             title="Render",
             message=("Render settings applied and output set to:\n"
-                     f"{rdir}\n\nThe standalone Render executable wasn't found, so start a "
-                     "Batch Render from Maya (Render menu) to write the frames."))
+                     f"{rdir}\n\nmayabatch wasn't found, so start a Batch Render from Maya "
+                     "(Render menu) to write the frames."))
         return
 
-    cmd = [render_exe, "-r", "file", "-s", str(s), "-e", str(e)]
-    cmd += ["-rl", _layer_for_cmd(STATE.render_layer)]
-    if STATE.render_camera and cmds.objExists(STATE.render_camera):
-        cmd += ["-cam", STATE.render_camera]
-    cmd += ["-x", str(int(STATE.render_res_w)), "-y", str(int(STATE.render_res_h))]
-    if rdir:
-        cmd += ["-rd", rdir]
-    cmd += ["-im", "<RenderLayer>/<RenderLayer>"]
+    # MEL run by mayabatch after it loads the scene: lock the range, point the images
+    # rule at our versioned Render folder, then render the sequence to disk.
+    rdir_fwd = (rdir or "").replace("\\", "/")
+    mel_cmd = (
+        f"playbackOptions -min {s} -max {e} -ast {s} -aet {e}; "
+        f"currentTime {s}; "
+        f"setAttr defaultRenderGlobals.startFrame {s}; "
+        f"setAttr defaultRenderGlobals.endFrame {e}; "
+        f"setAttr defaultRenderGlobals.animation 1; "
+    )
+    if rdir_fwd:
+        mel_cmd += f'workspace -fileRule "images" "{rdir_fwd}"; '
+    mel_cmd += "renderSequence;"
+
+    cmd = [mayabatch]
     if STATE.reg_path:
         cmd += ["-proj", os.path.dirname(STATE.reg_path)]
-    cmd += [fp]
+    cmd += ["-file", fp, "-command", mel_cmd]
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         subprocess.Popen(cmd, creationflags=creationflags)
-        print("CGPipeline: Batch render launched: " + " ".join(cmd))
+        print("CGPipeline: mayabatch render launched: " + subprocess.list2cmdline(cmd))
         cmds.confirmDialog(
             title="Render",
             message=(f"Batch render started → {rdir}\n\n"
                      f"Frames {s}-{e}, layer '{STATE.render_layer or 'masterLayer'}', "
                      f"{STATE.render_res_w}x{STATE.render_res_h}, .{STATE.render_format}."))
     except Exception as e2:
-        cmds.warning(f"CGPipeline: Could not launch batch render: {e2}")
+        cmds.warning(f"CGPipeline: Could not launch mayabatch render: {e2}")
 
 
 def _scene_cameras():
@@ -2435,7 +2449,7 @@ class CGPipelinePanel(QtWidgets.QWidget):
         # Format.
         grid.addWidget(QtWidgets.QLabel("Format:"), r, 0)
         self.render_format_combo = QtWidgets.QComboBox()
-        self.render_format_combo.addItems(["exr", "png", "tif", "jpg", "tga"])
+        self.render_format_combo.addItems(["png", "exr", "tif", "jpg", "tga"])
         self.render_format_combo.setCurrentText(STATE.render_format)
         self.render_format_combo.currentTextChanged.connect(
             lambda t: setattr(STATE, "render_format", t))
