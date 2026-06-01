@@ -70,6 +70,7 @@ class PipelineState:
     include_materials = True
     publish_whole_scene = False    # export everything; ignore the selection list
     update_master = True           # also refresh the *_master file on save / publish
+    publish_use_render_thumb = False   # publish thumbnail from latest render vs playblast
     publish_notes = ""       # comment sent to Kitsu on "Publish to Kitsu"
     publish_status = "NO CHANGE"   # status applied when publishing (no manual button)
 
@@ -857,8 +858,9 @@ def op_publish(to_kitsu=False):
     new_status = STATE.publish_status
     status_changed = _set_task_status(new_status)
 
-    # Always snapshot a thumbnail on publish and set it on the task.
-    thumb, tmsg = capture_task_thumbnail()
+    # Snapshot a thumbnail on publish — playblast by default, or the latest render when
+    # "Render as Thumbnail" is ticked.
+    thumb, tmsg = capture_task_thumbnail(prefer_render=STATE.publish_use_render_thumb)
     print(f"CGPipeline: Auto thumbnail: {tmsg}")
 
     status_line = f"\nStatus → {new_status}" if status_changed else ""
@@ -940,9 +942,9 @@ def _write_thumb_to_registry(path):
         return str(e)
 
 
-def capture_task_thumbnail():
-    """Set the entity's thumbnail. Prefers the latest rendered frame (so a lit/rendered
-    task shows the render); otherwise playblasts the active viewport. Writes to
+def capture_task_thumbnail(prefer_render=False):
+    """Set the entity's thumbnail. When `prefer_render` is True and a rendered frame
+    exists, use the latest render; otherwise playblast the active viewport. Writes to
     <project>/.thumbnails/<entity>.png and updates the registry. Returns (path, message)."""
     if not STATE.reg_path or not os.path.exists(STATE.reg_path) or not STATE.entity:
         return None, "No task context — open the task via the dashboard, or save inside a CGPipeline project."
@@ -955,17 +957,18 @@ def capture_task_thumbnail():
     clean = str(STATE.entity).replace(" ", "_")
     final_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
 
-    # Prefer the latest render, if any.
-    render_img = _latest_render_image()
-    if render_img:
-        try:
-            shutil.copy2(render_img, final_path)
-            err = _write_thumb_to_registry(final_path)
-            print(f"CGPipeline: Thumbnail from render → {render_img}")
-            return final_path, ("Thumbnail set from latest render."
-                                 if not err else f"Thumbnail set from render, registry update failed: {err}")
-        except Exception as ex:
-            print(f"CGPipeline: Could not use render as thumbnail ({ex}); playblasting instead.")
+    # Use the latest render only when asked (the Render button, or the publish option).
+    if prefer_render:
+        render_img = _latest_render_image()
+        if render_img:
+            try:
+                shutil.copy2(render_img, final_path)
+                err = _write_thumb_to_registry(final_path)
+                print(f"CGPipeline: Thumbnail from render → {render_img}")
+                return final_path, ("Thumbnail set from latest render."
+                                     if not err else f"Thumbnail set from render, registry update failed: {err}")
+            except Exception as ex:
+                print(f"CGPipeline: Could not use render as thumbnail ({ex}); playblasting instead.")
 
     panel = _thumbnail_panel()
     if not panel:
@@ -1527,10 +1530,10 @@ def _set_renderable_layer(layer):
 
 
 def op_render():
-    """Apply the Render-tab settings, save the scene, and start Maya's Batch Render
-    (the same as Render > Batch Render). It renders in the background — spawning mayabatch
-    under the hood — and writes frames to the images dir we point at
-    <entity_root>/Render/<task>/v###. Falls back to an in-session renderSequence."""
+    """Apply the Render-tab settings, save the scene, and render the frame range to disk
+    (in-session renderSequence — it blocks until done so we can set the result as the
+    thumbnail). Output goes to <entity_root>/Render/<task>/v###. After it finishes the
+    latest rendered frame becomes the task thumbnail."""
     rdir, s, e = _apply_render_settings()
     fp = cmds.file(q=True, sceneName=True)
     if not fp:
@@ -1541,28 +1544,28 @@ def op_render():
     except Exception as ex:
         print(f"CGPipeline: Could not save before render: {ex}")
 
-    started, mode = False, ""
-    # Maya's built-in Batch Render: backgrounds a mayabatch render of the current scene
-    # using the active renderer + render globals, writing to the workspace images dir.
+    print(f"CGPipeline: Rendering frames {s}-{e}, layer "
+          f"'{STATE.render_layer or 'masterLayer'}', {STATE.render_res_w}x{STATE.render_res_h}, "
+          f".{STATE.render_format} → {rdir} (please wait)…")
     try:
-        mel.eval('mayaBatchRenderProcedure(0, "", "", "", "")')
-        started, mode = True, "Batch render started in the background"
-        print(f"CGPipeline: Batch Render started → {rdir}")
+        mel.eval("renderSequence")
     except Exception as ex:
-        print(f"CGPipeline: Batch Render unavailable ({ex}); using renderSequence in-session.")
+        # Fall back to Maya's background Batch Render if renderSequence isn't available.
+        print(f"CGPipeline: renderSequence failed ({ex}); trying Batch Render.")
         try:
-            mel.eval("renderSequence")
-            started, mode = True, "Rendered in this session"
-            print(f"CGPipeline: renderSequence finished → {rdir}")
+            mel.eval('mayaBatchRenderProcedure(0, "", "", "", "")')
         except Exception as ex2:
             cmds.warning(f"CGPipeline: Render failed: {ex2}")
+            return
 
-    if started:
-        # Keep the details in the log; the dialog is just a simple confirmation.
-        print(f"CGPipeline: {mode} → {rdir} | frames {s}-{e}, "
-              f"layer '{STATE.render_layer or 'masterLayer'}', "
-              f"{STATE.render_res_w}x{STATE.render_res_h}, .{STATE.render_format}.")
-        cmds.confirmDialog(title="Render", message="Done Render")
+    # The render is the thumbnail (only on Render — publish handles its own thumbnail).
+    try:
+        _, tmsg = capture_task_thumbnail(prefer_render=True)
+        print(f"CGPipeline: Render thumbnail: {tmsg}")
+    except Exception as ex:
+        print(f"CGPipeline: Could not set render thumbnail: {ex}")
+
+    cmds.confirmDialog(title="Render", message="Rendering... Wait... Done!")
 
 
 def _scene_cameras():
@@ -2300,6 +2303,14 @@ class CGPipelinePanel(QtWidgets.QWidget):
             "Turn off to keep an existing master while you work on a different version.")
         self.master_chk.toggled.connect(lambda c: setattr(STATE, "update_master", c))
         opts.addWidget(self.master_chk)
+        self.render_thumb_chk = QtWidgets.QCheckBox("Render as Thumbnail")
+        self.render_thumb_chk.setChecked(STATE.publish_use_render_thumb)
+        self.render_thumb_chk.setToolTip(
+            "Use the latest rendered frame as the publish thumbnail instead of a viewport "
+            "snapshot.")
+        self.render_thumb_chk.toggled.connect(
+            lambda c: setattr(STATE, "publish_use_render_thumb", c))
+        opts.addWidget(self.render_thumb_chk)
         opts.addStretch()
         v.addLayout(opts)
 
