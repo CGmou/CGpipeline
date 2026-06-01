@@ -1430,72 +1430,11 @@ def _set_renderable_layer(layer):
             pass
 
 
-def _find_mayabatch_exe():
-    """mayabatch(.exe) — Maya in batch mode. Prefer $MAYA_LOCATION/bin (always set inside
-    Maya), then the dir of the running binary, then PATH."""
-    name = "mayabatch.exe" if os.name == "nt" else "maya"
-    cands = []
-    mloc = os.environ.get("MAYA_LOCATION", "")
-    if mloc:
-        cands.append(os.path.join(mloc, "bin", name))
-    try:
-        cands.append(os.path.join(os.path.dirname(sys.executable), name))
-    except Exception:
-        pass
-    for c in cands:
-        if c and os.path.exists(c):
-            return c
-    return shutil.which("mayabatch") or shutil.which("maya")
-
-
-def _write_render_melscript(rdir, s, e):
-    """Write a temp MEL script for mayabatch to source after loading the scene. Using a
-    file avoids fragile nested-quote escaping on the command line. Returns the path
-    (forward-slashed) or None."""
-    rdir_fwd = (rdir or "").replace("\\", "/")
-    lines = ["// CGPipeline batch render"]
-    if rdir_fwd:
-        lines.append(f'workspace -fileRule "images" "{rdir_fwd}";')
-    lines += [
-        "setAttr defaultRenderGlobals.animation 1;",
-        f"setAttr defaultRenderGlobals.startFrame {s};",
-        f"setAttr defaultRenderGlobals.endFrame {e};",
-        f"playbackOptions -min {s} -max {e} -animationStartTime {s} -animationEndTime {e};",
-        f"currentTime {s};",
-        r'print("CGPipeline: starting renderSequence...\n");',
-        "renderSequence;",
-        r'print("CGPipeline: render finished.\n");',
-    ]
-    try:
-        os.makedirs(SYSTEM_ROOT, exist_ok=True)
-        path = os.path.join(SYSTEM_ROOT, f"cgp_render_{os.getpid()}.mel")
-        with open(path, "w") as f:
-            f.write("\n".join(lines) + "\n")
-        return path.replace("\\", "/")
-    except Exception as ex:
-        print(f"CGPipeline: Could not write render script: {ex}")
-        return None
-
-
-def _render_in_session(rdir, s, e):
-    """Last-resort render inside this Maya session — blocks the UI but always produces
-    frames using the settings already applied."""
-    cmds.confirmDialog(
-        title="Render",
-        message=(f"Rendering in this Maya session → {rdir}\n\nMaya will be busy until "
-                 f"frames {s}-{e} finish."))
-    try:
-        mel.eval("renderSequence")
-        print(f"CGPipeline: In-session render finished → {rdir}")
-    except Exception as ex:
-        cmds.warning(f"CGPipeline: Render failed: {ex}")
-
-
 def op_render():
-    """Apply the Render-tab settings, save the scene, and launch a mayabatch batch render
-    into <entity_root>/Render/<task>_v###. mayabatch opens the saved scene in a visible
-    console and runs `renderSequence` over the frame range. Falls back to an in-session
-    render if mayabatch can't be found/launched."""
+    """Apply the Render-tab settings, save the scene, and start Maya's Batch Render
+    (the same as Render > Batch Render). It renders in the background — spawning mayabatch
+    under the hood — and writes frames to the images dir we point at
+    <entity_root>/Render/<task>_v###. Falls back to an in-session renderSequence."""
     rdir, s, e = _apply_render_settings()
     fp = cmds.file(q=True, sceneName=True)
     if not fp:
@@ -1506,30 +1445,29 @@ def op_render():
     except Exception as ex:
         print(f"CGPipeline: Could not save before render: {ex}")
 
-    mayabatch = _find_mayabatch_exe()
-    script = _write_render_melscript(rdir, s, e)
-    if mayabatch and script:
-        cmd = [mayabatch]
-        if STATE.reg_path:
-            cmd += ["-proj", os.path.dirname(STATE.reg_path)]
-        cmd += ["-file", fp, "-command", f'source "{script}"']
+    started, mode = False, ""
+    # Maya's built-in Batch Render: backgrounds a mayabatch render of the current scene
+    # using the active renderer + render globals, writing to the workspace images dir.
+    try:
+        mel.eval('mayaBatchRenderProcedure(0, "", "", "", "")')
+        started, mode = True, "Batch render started in the background"
+        print(f"CGPipeline: Batch Render started → {rdir}")
+    except Exception as ex:
+        print(f"CGPipeline: Batch Render unavailable ({ex}); using renderSequence in-session.")
         try:
-            # CREATE_NEW_CONSOLE → a visible mayabatch window the user can watch (it takes
-            # ~30s to boot, then renders). This is what "nothing happened" was missing.
-            creationflags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
-            subprocess.Popen(cmd, creationflags=creationflags)
-            print("CGPipeline: mayabatch render launched: " + subprocess.list2cmdline(cmd))
-            cmds.confirmDialog(
-                title="Render",
-                message=(f"Batch render launched in a mayabatch window → {rdir}\n\n"
-                         f"Frames {s}-{e}, layer '{STATE.render_layer or 'masterLayer'}', "
-                         f"{STATE.render_res_w}x{STATE.render_res_h}, .{STATE.render_format}.\n\n"
-                         "mayabatch takes ~30s to start — watch its console for progress."))
-            return
-        except Exception as e2:
-            print(f"CGPipeline: mayabatch launch failed ({e2}); rendering in-session.")
+            mel.eval("renderSequence")
+            started, mode = True, "Rendered in this session"
+            print(f"CGPipeline: renderSequence finished → {rdir}")
+        except Exception as ex2:
+            cmds.warning(f"CGPipeline: Render failed: {ex2}")
 
-    _render_in_session(rdir, s, e)
+    if started:
+        cmds.confirmDialog(
+            title="Render",
+            message=(f"{mode} → {rdir}\n\n"
+                     f"Frames {s}-{e}, layer '{STATE.render_layer or 'masterLayer'}', "
+                     f"{STATE.render_res_w}x{STATE.render_res_h}, .{STATE.render_format}.\n\n"
+                     "Progress shows in the Output Window / Script Editor."))
 
 
 def _scene_cameras():
