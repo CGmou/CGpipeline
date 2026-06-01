@@ -897,10 +897,53 @@ def _thumbnail_panel():
     return panels[0] if panels else None
 
 
+# Displayable render formats Qt can load for a thumbnail (EXR is skipped).
+_THUMBABLE_RENDER_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".bmp")
+
+
+def _latest_render_image():
+    """Newest displayable rendered frame under the entity's Render folder, or None.
+    Used so a published thumbnail reflects the actual render when one exists."""
+    root = _entity_root()
+    if not root:
+        return None
+    render_root = os.path.join(root, "Render")
+    if not os.path.isdir(render_root):
+        return None
+    best, best_mtime = None, -1.0
+    for dirpath, _dirs, files in os.walk(render_root):
+        for f in files:
+            if f.lower().endswith(_THUMBABLE_RENDER_EXTS):
+                full = os.path.join(dirpath, f)
+                try:
+                    m = os.path.getmtime(full)
+                except Exception:
+                    m = 0.0
+                if m > best_mtime:
+                    best, best_mtime = full, m
+    return best
+
+
+def _write_thumb_to_registry(path):
+    """Set `path` as the thumbnail for every task of the current entity. Returns an error
+    message, or "" on success."""
+    try:
+        with open(STATE.reg_path, "r") as f:
+            data = json.load(f)
+        for tk in data.get("tasks", []):
+            if tk.get("name") == STATE.entity:
+                tk["thumbnail"] = path
+        with open(STATE.reg_path, "w") as f:
+            json.dump(data, f, indent=4)
+        return ""
+    except Exception as e:
+        return str(e)
+
+
 def capture_task_thumbnail():
-    """Playblast the active viewport to <project>/.thumbnails/<entity>.png and set it as
-    the thumbnail for every task of the current entity in the registry (so the dashboard
-    card picks it up). Returns (path_or_None, message)."""
+    """Set the entity's thumbnail. Prefers the latest rendered frame (so a lit/rendered
+    task shows the render); otherwise playblasts the active viewport. Writes to
+    <project>/.thumbnails/<entity>.png and updates the registry. Returns (path, message)."""
     if not STATE.reg_path or not os.path.exists(STATE.reg_path) or not STATE.entity:
         return None, "No task context — open the task via the dashboard, or save inside a CGPipeline project."
     project_root = os.path.dirname(STATE.reg_path)
@@ -911,6 +954,18 @@ def capture_task_thumbnail():
         return None, f"Could not create thumbnails folder: {e}"
     clean = str(STATE.entity).replace(" ", "_")
     final_path = os.path.normpath(os.path.join(thumbs_dir, f"{clean}.png"))
+
+    # Prefer the latest render, if any.
+    render_img = _latest_render_image()
+    if render_img:
+        try:
+            shutil.copy2(render_img, final_path)
+            err = _write_thumb_to_registry(final_path)
+            print(f"CGPipeline: Thumbnail from render → {render_img}")
+            return final_path, ("Thumbnail set from latest render."
+                                 if not err else f"Thumbnail set from render, registry update failed: {err}")
+        except Exception as ex:
+            print(f"CGPipeline: Could not use render as thumbnail ({ex}); playblasting instead.")
 
     panel = _thumbnail_panel()
     if not panel:
@@ -957,17 +1012,9 @@ def capture_task_thumbnail():
             return None, "Playblast produced no image."
 
     # Update the registry so the dashboard card picks it up (all tasks of this entity).
-    try:
-        with open(STATE.reg_path, "r") as f:
-            data = json.load(f)
-        for tk in data.get("tasks", []):
-            if tk.get("name") == STATE.entity:
-                tk["thumbnail"] = final_path
-        with open(STATE.reg_path, "w") as f:
-            json.dump(data, f, indent=4)
-    except Exception as e:
-        return final_path, f"Thumbnail saved but registry update failed: {e}"
-
+    err = _write_thumb_to_registry(final_path)
+    if err:
+        return final_path, f"Thumbnail saved but registry update failed: {err}"
     print(f"CGPipeline: Thumbnail updated → {final_path}")
     return final_path, "Thumbnail updated."
 
@@ -1374,11 +1421,18 @@ def _set_image_format(ext):
 
 
 def _ensure_alpha_for_png():
-    """For PNG output, write the alpha (Mask) channel — i.e. don't skip alpha. This is the
-    renderable camera's .mask attribute (Render Settings ▸ Common ▸ "Alpha channel
-    (Mask)"). No-op for non-PNG formats."""
+    """For PNG output, write the alpha channel — i.e. don't skip alpha. On Arnold this is
+    defaultArnoldDriver.pngSkipAlpha (0 = keep alpha); for the Maya renderers it's the
+    renderable camera's .mask attribute. No-op for non-PNG formats."""
     if (STATE.render_format or "").lower() != "png":
         return
+    # Arnold PNG driver.
+    if cmds.objExists("defaultArnoldDriver"):
+        try:
+            cmds.setAttr("defaultArnoldDriver.pngSkipAlpha", 0)
+        except Exception as ex:
+            print(f"CGPipeline: Could not set pngSkipAlpha: {ex}")
+    # Maya Software/Hardware: the camera Mask channel.
     cam = STATE.render_camera
     shapes = []
     if cam and cmds.objExists(cam):
@@ -2482,8 +2536,10 @@ class CGPipelinePanel(QtWidgets.QWidget):
         self.render_autothread_chk.setChecked(STATE.render_autothread)
         self.render_autothread_chk.setToolTip("Use all available CPU cores.")
         self.render_threads_spin = QtWidgets.QSpinBox()
-        self.render_threads_spin.setRange(1, 256)
+        self.render_threads_spin.setRange(-256, 256)   # Arnold: negative = all cores minus N
         self.render_threads_spin.setValue(STATE.render_threads)
+        self.render_threads_spin.setToolTip(
+            "Thread count. Negative values mean all cores minus N (Arnold).")
         self.render_threads_spin.valueChanged.connect(
             lambda x: setattr(STATE, "render_threads", x))
         self.render_autothread_chk.toggled.connect(self._on_autothread_changed)
@@ -2501,11 +2557,6 @@ class CGPipelinePanel(QtWidgets.QWidget):
         hdr.addStretch()
         hdr.addWidget(self._btn("Refresh", self._refresh_render_lists))
         v.addLayout(hdr)
-
-        self.render_out_label = QtWidgets.QLabel("")
-        self.render_out_label.setWordWrap(True)
-        self.render_out_label.setStyleSheet("color: #888888; font-size: 11px;")
-        v.addWidget(self.render_out_label)
 
         v.addStretch()
         render_btn = self._btn("RENDER", op_render)
@@ -2568,9 +2619,6 @@ class CGPipelinePanel(QtWidgets.QWidget):
             self.render_start_spin.setValue(rng[0])
             self.render_end_spin.setValue(rng[1])
             STATE.render_start, STATE.render_end = rng
-
-        out = _render_output_dir()
-        self.render_out_label.setText(f"Output: {out}" if out else "Output: (no task context)")
 
     def _clear_cache_checks(self):
         """Untick every cache in the Assign-Lookdev list."""
