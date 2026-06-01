@@ -89,6 +89,8 @@ class PipelineState:
     render_res_h = 1080
     render_layer = ""
     render_format = "png"
+    render_autothread = True    # use all CPU cores
+    render_threads = 8          # used when autothread is off
 
     # Assembly
     lookdev_items = []      # [{name, path, asset_name}]
@@ -1308,14 +1310,15 @@ def _current_work_version():
 
 
 def _render_output_dir():
-    """<entity_root>/Render/<entity>_<abbr>_v###  — renders are versioned per work file."""
+    """<entity_root>/Render/<entity>_<abbr>/v###  — the version is its own folder so
+    renders are easy to browse per version."""
     root = _entity_root()
     if not root:
         return None
     abbr = TASK_ABBR.get(STATE.task_type, "task")
     ver = _current_work_version()
-    name = f"{STATE.entity or 'render'}_{abbr}_v{ver:03d}"
-    return os.path.normpath(os.path.join(root, "Render", name))
+    base = f"{STATE.entity or 'render'}_{abbr}"
+    return os.path.normpath(os.path.join(root, "Render", base, f"v{ver:03d}"))
 
 
 def _resolve_render_range():
@@ -1370,9 +1373,46 @@ def _set_image_format(ext):
             pass
 
 
+def _ensure_alpha_for_png():
+    """For PNG output, write the alpha (Mask) channel — i.e. don't skip alpha. This is the
+    renderable camera's .mask attribute (Render Settings ▸ Common ▸ "Alpha channel
+    (Mask)"). No-op for non-PNG formats."""
+    if (STATE.render_format or "").lower() != "png":
+        return
+    cam = STATE.render_camera
+    shapes = []
+    if cam and cmds.objExists(cam):
+        if cmds.nodeType(cam) == "camera":
+            shapes = [cam]
+        else:
+            shapes = cmds.listRelatives(cam, shapes=True, type="camera", fullPath=True) or []
+    if not shapes:
+        shapes = cmds.ls(type="camera", long=True) or []
+    for sh in shapes:
+        try:
+            cmds.setAttr(sh + ".mask", 1)
+        except Exception:
+            pass
+
+
+def _set_render_threads():
+    """Apply the thread settings to Arnold (the common renderer with a persistent thread
+    attr). Auto-thread uses all cores; otherwise the explicit count is used."""
+    if not cmds.objExists("defaultArnoldRenderOptions"):
+        return
+    try:
+        if STATE.render_autothread:
+            cmds.setAttr("defaultArnoldRenderOptions.threads_autodetect", 1)
+        else:
+            cmds.setAttr("defaultArnoldRenderOptions.threads_autodetect", 0)
+            cmds.setAttr("defaultArnoldRenderOptions.threads", int(STATE.render_threads))
+    except Exception as ex:
+        print(f"CGPipeline: Could not set render threads: {ex}")
+
+
 def _apply_render_settings():
     """Push the Render-tab settings onto the render globals and point the output at
-    <entity_root>/Render/<task>_v###. Returns (render_dir, start, end)."""
+    <entity_root>/Render/<task>/v###. Returns (render_dir, start, end)."""
     s, e = _resolve_render_range()
     # Resolution
     try:
@@ -1406,6 +1446,8 @@ def _apply_render_settings():
         _set_renderable_camera(STATE.render_camera)
     _set_renderable_layer(STATE.render_layer)
     _set_image_format(STATE.render_format)
+    _ensure_alpha_for_png()
+    _set_render_threads()
     # Output directory → the versioned Render folder. Set as the session 'images' rule
     # (not persisted) so a Maya-UI render lands there too; the batch render also gets it
     # explicitly via -rd.
@@ -1434,7 +1476,7 @@ def op_render():
     """Apply the Render-tab settings, save the scene, and start Maya's Batch Render
     (the same as Render > Batch Render). It renders in the background — spawning mayabatch
     under the hood — and writes frames to the images dir we point at
-    <entity_root>/Render/<task>_v###. Falls back to an in-session renderSequence."""
+    <entity_root>/Render/<task>/v###. Falls back to an in-session renderSequence."""
     rdir, s, e = _apply_render_settings()
     fp = cmds.file(q=True, sceneName=True)
     if not fp:
@@ -2433,6 +2475,27 @@ class CGPipelinePanel(QtWidgets.QWidget):
         grid.addWidget(self.render_format_combo, r, 1)
         r += 1
 
+        # Threads — Auto uses all cores, otherwise the typed count (Arnold).
+        grid.addWidget(QtWidgets.QLabel("Threads:"), r, 0)
+        trow = QtWidgets.QHBoxLayout()
+        trow.setContentsMargins(0, 0, 0, 0)
+        self.render_autothread_chk = QtWidgets.QCheckBox("Auto")
+        self.render_autothread_chk.setChecked(STATE.render_autothread)
+        self.render_autothread_chk.setToolTip("Use all available CPU cores.")
+        self.render_threads_spin = QtWidgets.QSpinBox()
+        self.render_threads_spin.setRange(1, 256)
+        self.render_threads_spin.setValue(STATE.render_threads)
+        self.render_threads_spin.valueChanged.connect(
+            lambda x: setattr(STATE, "render_threads", x))
+        self.render_autothread_chk.toggled.connect(self._on_autothread_changed)
+        trow.addWidget(self.render_autothread_chk)
+        trow.addWidget(self.render_threads_spin)
+        trow.addStretch()
+        twrap = QtWidgets.QWidget()
+        twrap.setLayout(trow)
+        grid.addWidget(twrap, r, 1)
+        r += 1
+
         v.addLayout(grid)
 
         hdr = QtWidgets.QHBoxLayout()
@@ -2453,7 +2516,13 @@ class CGPipelinePanel(QtWidgets.QWidget):
 
         self._refresh_render_lists()
         self._on_render_range_changed(STATE.render_range_mode)
+        self._on_autothread_changed(STATE.render_autothread)
         return self._wrap_scroll(w)
+
+    def _on_autothread_changed(self, checked):
+        STATE.render_autothread = checked
+        # The explicit thread count only applies when Auto is off.
+        self.render_threads_spin.setEnabled(not checked)
 
     def _on_render_range_changed(self, mode):
         STATE.render_range_mode = mode
