@@ -982,9 +982,15 @@ def capture_task_thumbnail(prefer_render=False):
         cmds.select(clear=True)
     except Exception:
         pass
+    # Draw the viewport before grabbing it; an offscreen playblast on Windows VP2 often
+    # returns a flat grey frame, so capture the on-screen panel instead.
+    try:
+        cmds.refresh(force=True)
+    except Exception:
+        pass
     kwargs = dict(
         completeFilename=final_path, format="image", compression="png",
-        frame=[cur], viewer=False, offScreen=True, showOrnaments=False,
+        frame=[cur], viewer=False, offScreen=False, showOrnaments=False,
         percent=100, quality=100, widthHeight=[640, 360], forceOverwrite=True,
     )
     try:
