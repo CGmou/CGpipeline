@@ -1504,12 +1504,11 @@ def op_render():
             cmds.warning(f"CGPipeline: Render failed: {ex2}")
 
     if started:
-        cmds.confirmDialog(
-            title="Render",
-            message=(f"{mode} → {rdir}\n\n"
-                     f"Frames {s}-{e}, layer '{STATE.render_layer or 'masterLayer'}', "
-                     f"{STATE.render_res_w}x{STATE.render_res_h}, .{STATE.render_format}.\n\n"
-                     "Progress shows in the Output Window / Script Editor."))
+        # Keep the details in the log; the dialog is just a simple confirmation.
+        print(f"CGPipeline: {mode} → {rdir} | frames {s}-{e}, "
+              f"layer '{STATE.render_layer or 'masterLayer'}', "
+              f"{STATE.render_res_w}x{STATE.render_res_h}, .{STATE.render_format}.")
+        cmds.confirmDialog(title="Render", message="Done Render")
 
 
 def _scene_cameras():
